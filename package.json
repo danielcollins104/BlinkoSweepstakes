@@ -1,0 +1,28 @@
+{
+  "name": "blinko-headline-chaos-sweepstakes",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --port 5174",
+    "server": "node server/server.js",
+    "start": "npm run build && node server/server.js",
+    "deploy": "npm run build && npx wrangler deploy",
+    "test": "node scripts/test-blinko-suite.js"
+  },
+  "dependencies": {
+    "lucide-react": "^0.460.0",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "vite": "^6.4.5"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+.wrangler
+.dev.vars
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env.local
+.DS_Store
