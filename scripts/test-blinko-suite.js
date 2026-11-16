@@ -234,6 +234,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   assert.equal(strChk.body.stripeSessionId, 'cs_test_12345');
 
   const whPayload = JSON.stringify({
+    id: 'evt_test_1',
     type: 'checkout.session.completed',
     data: {
       object: {
@@ -243,23 +244,36 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
       },
     },
   });
-  const ts = Math.floor(Date.now() / 1000);
-  const sig = crypto.createHmac('sha256', 'whsec_test_secret').update(`${ts}.${whPayload}`).digest('hex');
+  const signStripe = (payloadStr) => {
+    const tsNow = Math.floor(Date.now() / 1000);
+    const sigHex = crypto.createHmac('sha256', 'whsec_test_secret').update(`${tsNow}.${payloadStr}`).digest('hex');
+    return `t=${tsNow},v1=${sigHex}`;
+  };
   const whRes = await router.handleRequest(
     'POST',
     '/api/payments/stripe/webhook',
-    { 'stripe-signature': `t=${ts},v1=${sig}` },
+    { 'stripe-signature': signStripe(whPayload) },
     whPayload
   );
   assert.equal(whRes.status, 200);
   assert.equal(whRes.body.handled, true);
 
-  // Admin adjusts +300 SC and player plays through unplayed SC to retain >= 50 SC at 30% RTP
+  // Duplicate Stripe event idempotency check
+  const whDup = await router.handleRequest(
+    'POST',
+    '/api/payments/stripe/webhook',
+    { 'stripe-signature': signStripe(whPayload) },
+    whPayload
+  );
+  assert.equal(whDup.status, 200);
+  assert.equal(whDup.body.duplicate, true);
+
+  // Admin adjusts +1200 SC so player retains >= 150 SC after 1x playthrough at 30% RTP
   await router.handleRequest(
     'POST',
     '/api/admin/adjust-balance',
     { authorization: `Bearer ${adminToken}` },
-    { targetUserId: reg.body.user.id, currency: 'SC', amount: 300, reason: 'Test rollover setup' }
+    { targetUserId: reg.body.user.id, currency: 'SC', amount: 1200, reason: 'Test rollover setup' }
   );
 
   // Play through all unplayed SC via single drop
@@ -348,6 +362,72 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   );
   assert.equal(paidRes.status, 200);
   assert.equal(paidRes.body.redemption.status, 'paid');
+
+  // Stripe payout.paid webhook settles pending stripe_bank redemption automatically
+  const strPayout1 = await router.handleRequest(
+    'POST',
+    '/api/redeem',
+    { authorization: `Bearer ${token}` },
+    { amountSC: 50, method: 'stripe_bank', destination: 'acct_player_123' }
+  );
+  assert.equal(strPayout1.status, 200, JSON.stringify(strPayout1.body));
+  const payoutPaidEvt = JSON.stringify({
+    id: 'evt_payout_paid_1',
+    type: 'payout.paid',
+    data: { object: { id: 'po_live_1001', metadata: { redemptionId: strPayout1.body.redemption.id } } },
+  });
+  const payoutPaidWh = await router.handleRequest(
+    'POST',
+    '/api/payments/stripe/webhook',
+    { 'stripe-signature': signStripe(payoutPaidEvt) },
+    payoutPaidEvt
+  );
+  assert.equal(payoutPaidWh.status, 200);
+  assert.equal(payoutPaidWh.body.redemption.status, 'paid');
+
+  // Stripe payout.failed webhook refunds SC back to player redeemable balance
+  const balBeforeFailRdm = payoutPaidWh.body.balance.sweepsCoins;
+  const strPayout2 = await router.handleRequest(
+    'POST',
+    '/api/redeem',
+    { authorization: `Bearer ${token}` },
+    { amountSC: 50, method: 'stripe_bank', destination: 'acct_player_123' }
+  );
+  assert.equal(strPayout2.status, 200, JSON.stringify(strPayout2.body));
+  const payoutFailEvt = JSON.stringify({
+    id: 'evt_payout_fail_1',
+    type: 'payout.failed',
+    data: {
+      object: {
+        id: 'po_live_1002',
+        failure_message: 'Bank account closed',
+        metadata: { redemptionId: strPayout2.body.redemption.id },
+      },
+    },
+  });
+  const payoutFailWh = await router.handleRequest(
+    'POST',
+    '/api/payments/stripe/webhook',
+    { 'stripe-signature': signStripe(payoutFailEvt) },
+    payoutFailEvt
+  );
+  assert.equal(payoutFailWh.status, 200);
+  assert.equal(payoutFailWh.body.redemption.status, 'rejected');
+  assert.equal(payoutFailWh.body.balance.sweepsCoins, balBeforeFailRdm);
+
+  // Stripe charge.dispute.created webhook appends to audit ledger cleanly
+  const disputeEvt = JSON.stringify({
+    id: 'evt_dispute_1',
+    type: 'charge.dispute.created',
+    data: { object: { id: 'dp_1001', amount: 1999, reason: 'fraudulent', metadata: { userId: reg.body.user.id } } },
+  });
+  const disputeWh = await router.handleRequest(
+    'POST',
+    '/api/payments/stripe/webhook',
+    { 'stripe-signature': signStripe(disputeEvt) },
+    disputeEvt
+  );
+  assert.equal(disputeWh.status, 200);
 
   // Verify Merkle Audit Ledger integrity
   const ledgerCheck = await router.handleRequest('GET', '/api/admin/ledger', { authorization: `Bearer ${adminToken}` });

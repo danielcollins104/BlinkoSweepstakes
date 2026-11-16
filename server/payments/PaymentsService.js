@@ -686,15 +686,133 @@ export class PaymentsService {
 
   handleStripeWebhook(rawBody, signatureHeader) {
     const event = this.stripe.verifyWebhookSignature(rawBody, signatureHeader);
-    if (event.type === 'checkout.session.completed' && event.data?.object?.payment_status === 'paid') {
-      const obj = event.data.object;
-      const ref = obj.client_reference_id || obj.metadata?.sessionRef;
-      if (ref) {
-        const rec = this.store.get('stripe_sessions', ref);
-        if (rec) return { handled: true, ...this._creditStripeSession(rec) };
-      }
+    const eventKey = event.id ? `stripe_evt:${event.id}` : null;
+    if (eventKey && this.store.get('claimed_tx', eventKey)) {
+      return { handled: true, duplicate: true, eventType: event.type };
     }
-    return { handled: true, eventType: event.type };
+
+    const markEventProcessed = () => {
+      if (eventKey) {
+        this.store.insert('claimed_tx', eventKey, {
+          kind: 'stripe_event',
+          refId: event.id,
+          userId: event.data?.object?.metadata?.userId || 'SYSTEM',
+          at: new Date().toISOString(),
+        });
+      }
+    };
+
+    return this.store.transaction(() => {
+      const obj = event.data?.object || {};
+      const ref = obj.client_reference_id || obj.metadata?.sessionRef;
+
+      if (
+        (event.type === 'checkout.session.completed' && obj.payment_status === 'paid') ||
+        event.type === 'checkout.session.async_payment_succeeded'
+      ) {
+        if (ref) {
+          const rec = this.store.get('stripe_sessions', ref);
+          if (rec) {
+            const res = this._creditStripeSession(rec);
+            markEventProcessed();
+            return { handled: true, eventType: event.type, ...res };
+          }
+        }
+        markEventProcessed();
+        return { handled: true, eventType: event.type };
+      }
+
+      if (event.type === 'checkout.session.async_payment_failed' || event.type === 'checkout.session.expired') {
+        if (ref) {
+          const rec = this.store.get('stripe_sessions', ref);
+          if (rec && rec.status === 'pending') {
+            rec.status = event.type.endsWith('expired') ? 'expired' : 'failed';
+            rec.updatedAt = new Date().toISOString();
+            this.store.put('stripe_sessions', rec.id, rec);
+          }
+        }
+        markEventProcessed();
+        return { handled: true, eventType: event.type };
+      }
+
+      if (event.type === 'payout.paid' || event.type === 'transfer.created') {
+        const rdmId = obj.metadata?.redemptionId;
+        if (rdmId) {
+          const r = this.store.get('redemptions', rdmId);
+          if (r && ['pending_review', 'approved'].includes(r.status)) {
+            const claimKey = `payout_stripe:${String(obj.id).toLowerCase()}`;
+            if (!this.store.get('claimed_tx', claimKey)) {
+              this.store.insert('claimed_tx', claimKey, {
+                kind: 'payout',
+                refId: r.id,
+                userId: r.userId,
+                at: new Date().toISOString(),
+              });
+            }
+            const balance = this.wallet.settleRedemptionSync(r.userId, r.amountCents, {
+              redemptionId: r.id,
+              method: r.method,
+              receipt: obj.id,
+              paidBy: 'stripe_webhook',
+            });
+            Object.assign(r, {
+              status: 'paid',
+              txHashOrReceipt: obj.id,
+              paidAt: new Date().toISOString(),
+              paidBy: 'stripe_webhook',
+            });
+            this.store.put('redemptions', r.id, r);
+            markEventProcessed();
+            return { handled: true, eventType: event.type, redemption: r, balance };
+          }
+        }
+        markEventProcessed();
+        return { handled: true, eventType: event.type };
+      }
+
+      if (event.type === 'payout.failed' || event.type === 'payout.canceled') {
+        const rdmId = obj.metadata?.redemptionId;
+        if (rdmId) {
+          const r = this.store.get('redemptions', rdmId);
+          if (r && ['pending_review', 'approved'].includes(r.status)) {
+            const reason = obj.failure_message || 'Stripe payout failed or canceled';
+            const balance = this.wallet.refundRedemptionSync(r.userId, r.amountCents, {
+              redemptionId: r.id,
+              reason,
+              rejectedBy: 'stripe_webhook',
+            });
+            Object.assign(r, {
+              status: 'rejected',
+              rejectionReason: reason,
+              rejectedAt: new Date().toISOString(),
+              rejectedBy: 'stripe_webhook',
+            });
+            this.store.put('redemptions', r.id, r);
+            markEventProcessed();
+            return { handled: true, eventType: event.type, redemption: r, balance };
+          }
+        }
+        markEventProcessed();
+        return { handled: true, eventType: event.type };
+      }
+
+      if (event.type === 'charge.dispute.created' || event.type === 'charge.refunded') {
+        this.ledger.append({
+          userId: obj.metadata?.userId || 'SYSTEM',
+          type: event.type === 'charge.dispute.created' ? 'STRIPE_DISPUTE_CREATED' : 'STRIPE_CHARGE_REFUNDED',
+          currency: 'SYSTEM',
+          amount: Number(obj.amount || 0) / 100,
+          balanceBefore: 0,
+          balanceAfter: 0,
+          metadata: { stripeObjectId: obj.id || null, reason: obj.reason || null },
+        });
+        markEventProcessed();
+        return { handled: true, eventType: event.type };
+      }
+
+      markEventProcessed();
+      return { handled: true, eventType: event.type };
+    });
   }
 
   // ---------------------------------------------------------------------------

@@ -1,5 +1,18 @@
 import crypto from 'node:crypto';
 
+export const STRIPE_WEBHOOK_EVENTS = [
+  'checkout.session.completed',
+  'checkout.session.async_payment_succeeded',
+  'checkout.session.async_payment_failed',
+  'checkout.session.expired',
+  'payout.paid',
+  'payout.failed',
+  'payout.canceled',
+  'transfer.created',
+  'charge.dispute.created',
+  'charge.refunded',
+];
+
 /**
  * Live Stripe REST API Client (zero external SDK dependency, uses native fetch).
  * Active automatically when STRIPE_SECRET_KEY is configured in environment.
@@ -22,6 +35,7 @@ export class StripeGateway {
       enabled: this.enabled,
       publishableKey: this.enabled ? this.publishableKey : null,
       webhookConfigured: Boolean(this.webhookSecret),
+      webhookEvents: STRIPE_WEBHOOK_EVENTS,
     };
   }
 
