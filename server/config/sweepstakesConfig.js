@@ -6,11 +6,11 @@
 // ============================================================================
 
 export function getCashtagHandle(env = {}) {
-  return (
-    (env && env.CASHTAG) ||
-    (typeof process !== 'undefined' && process.env?.CASHTAG) ||
-    '$Daniel-Collins-168'
-  );
+  const fromEnv =
+    (env && (env.CASHTAG_HANDLE || env.CASHTAG)) ||
+    (typeof process !== 'undefined' && (process.env?.CASHTAG_HANDLE || process.env?.CASHTAG)) ||
+    '';
+  return String(fromEnv).trim() || '$Daniel-Collins-168';
 }
 
 export const CRYPTO_WALLET_ADDRESSES = {

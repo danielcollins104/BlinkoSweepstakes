@@ -10,7 +10,10 @@ const list = (v, dflt) =>
     ? dflt
     : String(v).split(',').map((s) => s.trim().toUpperCase()).filter(Boolean);
 
-const bool = (v, dflt) => (v === undefined || v === null || v === '' ? dflt : String(v).toLowerCase() === 'true');
+const bool = (v, dflt) => {
+  const s = v === undefined || v === null ? '' : String(v).trim();
+  return s === '' ? dflt : s.toLowerCase() === 'true';
+};
 const num = (v, dflt) => (Number(v) > 0 ? Number(v) : dflt);
 
 export function loadComplianceConfig(env = {}, defaults = {}) {

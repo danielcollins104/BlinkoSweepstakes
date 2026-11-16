@@ -3,7 +3,12 @@ import { ApiRouter } from './apiRouter.js';
 import { SqlStore, createDurableObjectDriver } from './store/Store.js';
 
 const STATIC_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com";
+  "default-src 'self'; script-src 'self' https://secure.nmi.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://secure.nmi.com; frame-src https://secure.nmi.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com";
+
+function parseGeoEnforce(env) {
+  const rawGeo = String(env?.GEO_ENFORCE ?? '').trim();
+  return rawGeo !== '' ? rawGeo.toLowerCase() === 'true' : true;
+}
 
 function buildWorkerResponse(response) {
   const headers = new Headers();
@@ -29,7 +34,7 @@ export class BlinkoCore extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.store = new SqlStore(createDurableObjectDriver(ctx.storage));
-    const geoEnforce = env?.GEO_ENFORCE !== undefined ? String(env.GEO_ENFORCE).toLowerCase() === 'true' : true;
+    const geoEnforce = parseGeoEnforce(env);
     this.router = new ApiRouter({ store: this.store, env: env || {}, geoEnforce });
   }
 
@@ -62,7 +67,7 @@ export class BlinkoCore extends DurableObject {
 let fallbackRouter = null;
 function getFallbackRouter(env) {
   if (!fallbackRouter) {
-    const geoEnforce = env?.GEO_ENFORCE !== undefined ? String(env.GEO_ENFORCE).toLowerCase() === 'true' : true;
+    const geoEnforce = parseGeoEnforce(env);
     fallbackRouter = new ApiRouter({ env: env || {}, geoEnforce });
   }
   return fallbackRouter;

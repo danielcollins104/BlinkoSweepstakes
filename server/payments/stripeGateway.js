@@ -19,10 +19,10 @@ export const STRIPE_WEBHOOK_EVENTS = [
  */
 export class StripeGateway {
   constructor({ env = {}, fetchImpl } = {}) {
-    this.secretKey = env.STRIPE_SECRET_KEY || null;
-    this.publishableKey = env.STRIPE_PUBLISHABLE_KEY || null;
-    this.webhookSecret = env.STRIPE_WEBHOOK_SECRET || null;
-    this.apiBase = String(env.STRIPE_API_BASE || 'https://api.stripe.com/v1').replace(/\/+$/, '');
+    this.secretKey = String(env.STRIPE_SECRET_KEY || '').trim() || null;
+    this.publishableKey = String(env.STRIPE_PUBLISHABLE_KEY || '').trim() || null;
+    this.webhookSecret = String(env.STRIPE_WEBHOOK_SECRET || '').trim() || null;
+    this.apiBase = String(env.STRIPE_API_BASE || 'https://api.stripe.com/v1').trim().replace(/\/+$/, '');
     this.fetch = fetchImpl || ((...a) => fetch(...a));
   }
 

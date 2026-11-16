@@ -11,7 +11,8 @@ export class AuthService {
     this.store = store;
     this.ledger = ledger;
     this.adminSecret =
-      options.adminSecret || (typeof process !== 'undefined' && process.env?.DC_ADMIN_SECRET) || null;
+      String(options.adminSecret || (typeof process !== 'undefined' && process.env?.DC_ADMIN_SECRET) || '').trim() ||
+      null;
     this.failedAttempts = new Map();
     this._lastPurge = 0;
   }

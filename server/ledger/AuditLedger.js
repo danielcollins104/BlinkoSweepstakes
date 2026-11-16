@@ -4,7 +4,7 @@ export const GENESIS_PREV_HASH = '0'.repeat(64);
 
 export function resolveSecret(name, provided, { requireSecrets = false } = {}) {
   const fromEnv = typeof process !== 'undefined' ? process.env?.[name] : undefined;
-  const value = provided || fromEnv || null;
+  const value = String(provided || fromEnv || '').trim() || null;
   if (value) return value;
   if (requireSecrets) {
     throw new Error(`${name} is not configured.`);
@@ -21,7 +21,13 @@ export class AuditLedger {
     if (!store) throw new Error('AuditLedger requires a store');
     this.store = store;
     const secretMeta = store.get('meta', 'ledger_secret');
-    const resolved = options.ledgerSecret || (typeof process !== 'undefined' ? process.env?.DC_LEDGER_SECRET : null) || secretMeta?.value || null;
+    const resolved =
+      String(
+        options.ledgerSecret ||
+          (typeof process !== 'undefined' ? process.env?.DC_LEDGER_SECRET : '') ||
+          secretMeta?.value ||
+          ''
+      ).trim() || null;
     if (resolved) {
       this.ledgerSecret = resolved;
     } else {

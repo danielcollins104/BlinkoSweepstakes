@@ -53,6 +53,12 @@ function maskDestination(dest) {
   return `${s.slice(0, 6)}…${s.slice(-4)}`;
 }
 
+function normalizeOrigin(raw) {
+  const t = String(raw || '').trim().replace(/\/+$/, '');
+  if (!t) return null;
+  return /^https?:\/\//i.test(t) ? t : `https://${t}`;
+}
+
 export class PaymentsService {
   constructor(deps) {
     this.store = deps.store;
@@ -644,15 +650,11 @@ export class PaymentsService {
     this._assertDepositLimits(session.userId, pkg.priceUsd);
     const sessionRef = newId('str');
     const configuredOrigin =
-      this.env.PUBLIC_ORIGIN ||
-      String(this.env.ALLOWED_ORIGINS || '')
-        .split(',')
-        .map((s) => s.trim())
-        .find(Boolean) ||
-      null;
-    const baseOrigin = String(
-      configuredOrigin || (isSecure ? 'https://blinkosweepstakes.oopsiwon.com' : `http://localhost:${this.env.PORT || 3002}`)
-    ).replace(/\/+$/, '');
+      normalizeOrigin(this.env.PUBLIC_ORIGIN) ||
+      normalizeOrigin(String(this.env.ALLOWED_ORIGINS || '').split(',')[0]);
+    const baseOrigin =
+      configuredOrigin ||
+      (isSecure ? 'https://blinkosweepstakes.oopsiwon.com' : `http://localhost:${this.env.PORT || 3002}`);
     const stripeRes = await this.stripe.createCheckoutSession({
       sessionRef,
       packageTitle: pkg.tierTitle,
