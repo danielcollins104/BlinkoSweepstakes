@@ -1,55 +1,29 @@
 // ============================================================================
-// SWEEPSTAKES CASINO DUAL-CURRENCY ECONOMY MODEL (GC / SC)
+// SERVER-ONLY AUTHORITATIVE SWEEPSTAKES ECONOMY & STORE CONFIGURATION
 // ============================================================================
-// 1. Gold Coins (GC):
-//    - Social fun-play currency only. Cannot be redeemed for cash or prizes.
-//    - Purchased in packages or granted via Welcome / Daily Login / AMOE bonuses.
-//
-// 2. Sweeps Coins (SC):
-//    - Promotional sweepstakes currency (1.00 SC = $1.00 USD prize value).
-//    - NEVER sold directly. Always awarded as FREE promotional bonus entries
-//      alongside Gold Coin purchases, Registration Welcome Grant, Daily Login,
-//      or Alternative Method of Entry (AMOE).
-//    - Subject to 1x playthrough requirement before becoming redeemable.
+// Never bundled into client JS. Safe display projections are exposed via
+// publicGameStoreConfig(compliance).
 // ============================================================================
 
-export const CASHTAG_HANDLE =
-  (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CASHTAG) ||
-  '$Daniel-Collins-168';
+export function getCashtagHandle(env = {}) {
+  return (
+    (env && env.CASHTAG) ||
+    (typeof process !== 'undefined' && process.env?.CASHTAG) ||
+    '$Daniel-Collins-168'
+  );
+}
 
 export const CRYPTO_WALLET_ADDRESSES = {
-  BTC:
-    (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CRYPTO_WALLET_BTC) ||
-    'bc1qwhnp4ylpv2h2q5x0rr9zm3zpwfcw3rtdmz4q4q',
-  ETH:
-    (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CRYPTO_WALLET_ETH) ||
-    '0x6258e488F97617cc103838746955CB81a1d3E3af',
-  SOL:
-    (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CRYPTO_WALLET_SOL) ||
-    'Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f',
-  USDT_SOL:
-    (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CRYPTO_WALLET_USDT_SOL) ||
-    'Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f',
-  USDT_ERC20:
-    (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_CRYPTO_WALLET_USDT_ERC20) ||
-    '0x6258e488F97617cc103838746955CB81a1d3E3af',
+  BTC: 'bc1qwhnp4ylpv2h2q5x0rr9zm3zpwfcw3rtdmz4q4q',
+  ETH: '0x6258e488F97617cc103838746955CB81a1d3E3af',
+  SOL: 'Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f',
+  USDT_SOL: 'Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f',
+  USDT_ERC20: '0x6258e488F97617cc103838746955CB81a1d3E3af',
 };
-
-export function getCashAppPaymentLink(priceUsd, orderRef = '', handle = CASHTAG_HANDLE) {
-  const cleanHandle = String(handle || CASHTAG_HANDLE).startsWith('$')
-    ? String(handle || CASHTAG_HANDLE)
-    : `$${handle}`;
-  const num = Number(priceUsd) || 0;
-  const formatted = num % 1 === 0 ? num.toString() : num.toFixed(2);
-  const base = `https://cash.app/${cleanHandle}/${formatted}`;
-  return orderRef ? `${base}?note=${encodeURIComponent(orderRef)}` : base;
-}
 
 export const SWEEPSTAKES_CONFIG = {
   brandName: 'BLINKO: Headline Chaos 2026',
-  cashtagHandle: CASHTAG_HANDLE,
 
-  // Starting bankroll for registered players (guests receive GC only)
   defaultGoldCoins: 100000,
   defaultSweepsCoins: 10.0,
   minRedemptionSC: 50.0,
@@ -260,5 +234,23 @@ export function calculateCustomPackage(amountUsd) {
     tagline: `${goldCoins.toLocaleString()} GC + FREE ${freeSweepsCoins.toFixed(2)} SC`,
     isCustom: true,
     accent: '#22d3ee',
+  };
+}
+
+/**
+ * Safe public store projection — excludes all operator wallet addresses and Cashtag handles.
+ */
+export function publicGameStoreConfig(compliance = {}) {
+  return {
+    storePackages: SWEEPSTAKES_CONFIG.storePackages,
+    highRollerPackages: SWEEPSTAKES_CONFIG.highRollerPackages,
+    redemptionMethods: SWEEPSTAKES_CONFIG.redemptionMethods,
+    giftCardBrands: SWEEPSTAKES_CONFIG.giftCardBrands,
+    dailyReward: SWEEPSTAKES_CONFIG.dailyReward,
+    amoeReward: SWEEPSTAKES_CONFIG.amoeReward,
+    minRedemptionSC: SWEEPSTAKES_CONFIG.minRedemptionSC,
+    minGiftCardRedemptionSC: SWEEPSTAKES_CONFIG.minGiftCardRedemptionSC,
+    giftCardBonusRate: SWEEPSTAKES_CONFIG.giftCardBonusRate,
+    restrictedStates: compliance?.restrictedStates || [],
   };
 }

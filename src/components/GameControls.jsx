@@ -1,14 +1,9 @@
 import React from 'react';
 import { Shuffle, Zap, Play, Pause } from 'lucide-react';
-import {
-  BLINKO_ROWS,
-  BLINKO_RISKS,
-  BLINKO_BALL_COUNTS,
-  BET_LIMITS,
-  MEME_CHARACTERS,
-} from '../config/blinkoConfig';
+import { MEME_CHARACTERS } from '../config/memeCast';
 
 export default function GameControls({
+  gameConfig,
   currencyMode,
   betPerBall,
   onChangeBet,
@@ -26,7 +21,15 @@ export default function GameControls({
   busy,
   balance,
 }) {
-  const limits = BET_LIMITS[currencyMode];
+  const rowsList = gameConfig?.rows || [8, 12, 16];
+  const risksList = gameConfig?.risks || ['LOW', 'MEDIUM', 'HIGH'];
+  const ballCountsList = gameConfig?.ballCounts || [1, 3, 5, 10];
+  const limits = gameConfig?.betLimits?.[currencyMode] || {
+    min: currencyMode === 'SC' ? 0.1 : 10,
+    max: currencyMode === 'SC' ? 500 : 1000000,
+    presets: [],
+  };
+
   const available = currencyMode === 'SC' ? Number(balance?.sweepsCoins || 0) : Number(balance?.goldCoins || 0);
   const totalBet = currencyMode === 'SC' ? Number((betPerBall * ballCount).toFixed(2)) : Math.round(betPerBall * ballCount);
   const activeChar = MEME_CHARACTERS.find((c) => c.id === characterId);
@@ -84,7 +87,7 @@ export default function GameControls({
         </div>
 
         <div className="preset-chips">
-          {limits.presets.map((p) => (
+          {(limits.presets || []).map((p) => (
             <button
               key={p}
               type="button"
@@ -103,7 +106,7 @@ export default function GameControls({
             News Volatility
           </span>
           <div className="segmented-group" role="group" aria-labelledby="risk-group-label">
-            {BLINKO_RISKS.map((r) => (
+            {risksList.map((r) => (
               <button
                 key={r}
                 type="button"
@@ -121,7 +124,7 @@ export default function GameControls({
             Peg Rows
           </span>
           <div className="segmented-group" role="group" aria-labelledby="rows-group-label">
-            {BLINKO_ROWS.map((r) => (
+            {rowsList.map((r) => (
               <button
                 key={r}
                 type="button"
@@ -140,7 +143,7 @@ export default function GameControls({
           Simultaneous Pucks
         </span>
         <div className="segmented-group" role="group" aria-labelledby="balls-group-label">
-          {BLINKO_BALL_COUNTS.map((cnt) => (
+          {ballCountsList.map((cnt) => (
             <button
               key={cnt}
               type="button"

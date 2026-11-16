@@ -4,10 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BLINKO_MULTIPLIERS, BLINKO_ROWS, BLINKO_RISKS } from '../src/config/blinkoConfig.js';
+import { BLINKO_MULTIPLIERS, BLINKO_ROWS, BLINKO_RISKS } from '../server/config/gameConfig.js';
 import { ApiRouter } from '../server/apiRouter.js';
 import { openDefaultSqliteStore } from '../server/store/nodeSqlite.js';
-import { PriceOracle, getAsset, displayToChainUnits, usdToDisplayUnits } from '../server/payments/cryptoAssets.js';
+import { PriceOracle, displayToChainUnits } from '../server/payments/cryptoAssets.js';
 
 let passed = 0;
 async function test(name, fn) {
@@ -32,6 +32,14 @@ function nCk(n, k) {
   return Number(num / den);
 }
 
+function extractCookie(res, name) {
+  const raw = res.headers['Set-Cookie'];
+  const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const hit = list.find((c) => c.startsWith(`${name}=`));
+  if (!hit) return null;
+  return hit.split(';')[0];
+}
+
 // 1. Binomial RTP verification across all 9 tables (~30.0%)
 await test('Binomial RTP is calibrated at ~30.0% across all 9 tables', () => {
   for (const rows of BLINKO_ROWS) {
@@ -49,8 +57,8 @@ await test('Binomial RTP is calibrated at ~30.0% across all 9 tables', () => {
   }
 });
 
-// 2. End-to-end API, Provably Fair, Dual-Currency, Playthrough, Crypto, CashApp, Stripe & KYC/Payout tests
-await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', async () => {
+// 2. End-to-end security invariants, HttpOnly cookies, CSRF guard, Provably Fair & Live Payment Rails
+await test('Full Security Boundaries + Sweepstakes Flow + Live Payment Rails + SQLite Persistence', async () => {
   const tmpDb = path.join(os.tmpdir(), `blinko_test_${Date.now()}.sqlite`);
   const sqlStore = await openDefaultSqliteStore(tmpDb);
 
@@ -59,7 +67,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   mockOracle.cache.set('SOL', { price: 200, at: Date.now(), sources: ['mock'] });
 
   const mockVerifier = {
-    async verifyTransfer({ asset, txHash, recipient }) {
+    async verifyTransfer({ asset, txHash }) {
       if (txHash === 'bad_tx') return { found: false, amountRaw: 0n, confirmations: 0 };
       const expectedUnits = this._nextAmountUnits || 0n;
       return {
@@ -72,8 +80,10 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
     },
   };
 
+  let lastStripeBody = '';
   const mockStripeFetch = async (url, init) => {
     if (url.endsWith('/checkout/sessions') && init.method === 'POST') {
+      lastStripeBody = String(init.body || '');
       return new Response(
         JSON.stringify({ id: 'cs_test_12345', url: 'https://checkout.stripe.com/pay/cs_test_12345' }),
         { status: 200, headers: { 'content-type': 'application/json' } }
@@ -97,36 +107,63 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
       DC_ADMIN_SECRET: 'test-operator-secret',
       STRIPE_SECRET_KEY: 'sk_test_mock_key',
       STRIPE_WEBHOOK_SECRET: 'whsec_test_secret',
+      PUBLIC_ORIGIN: 'https://blinkosweepstakes.oopsiwon.com',
     },
     priceOracle: mockOracle,
     verifier: mockVerifier,
     fetchImpl: mockStripeFetch,
   });
 
-  // Guest cannot play SC
-  const guestRes = await router.handleRequest('POST', '/api/auth/guest', {});
+  const csrf = { 'x-requested-with': 'BlinkoClient' };
+
+  // Unauthenticated /api/payments/config MUST NOT leak wallet addresses or $Cashtag
+  const pubPay = await router.handleRequest('GET', '/api/payments/config', {});
+  assert.equal(pubPay.status, 200);
+  const pubJson = JSON.stringify(pubPay.body);
+  assert.equal(pubPay.body.cashApp.cashtag, undefined);
+  assert.ok(!pubJson.includes('Daniel-Collins'));
+  assert.ok(!pubJson.includes('bc1qwhnp'));
+  assert.ok(!pubJson.includes('Ejj7hyeP'));
+
+  // /api/game/config returns safe board & bundle display metadata
+  const gameCfg = await router.handleRequest('GET', '/api/game/config', {});
+  assert.equal(gameCfg.status, 200);
+  assert.ok(gameCfg.body.multipliers['16'].HIGH);
+  assert.ok(gameCfg.body.storePackages.length >= 6);
+
+  // CSRF check: POST without X-Requested-With: BlinkoClient must fail with 403
+  const csrfBlocked = await router.handleRequest('POST', '/api/auth/guest', {}, {});
+  assert.equal(csrfBlocked.status, 403);
+
+  // Guest session issued strictly via HttpOnly; SameSite=Strict cookie (no token in JSON body)
+  const guestRes = await router.handleRequest('POST', '/api/auth/guest', csrf);
   assert.equal(guestRes.status, 200);
-  const guestToken = guestRes.body.token;
+  assert.equal(guestRes.body.token, undefined);
+  const guestCookie = extractCookie(guestRes, 'blk_session');
+  assert.ok(guestCookie && guestRes.headers['Set-Cookie'][0].includes('HttpOnly'));
+  assert.ok(guestRes.headers['Set-Cookie'][0].includes('SameSite=Strict'));
   assert.equal(guestRes.body.balance.goldCoins, 100000);
   assert.equal(guestRes.body.balance.sweepsCoins, 0);
 
   const guestScBlocked = await router.handleRequest(
     'POST',
     '/api/drop',
-    { authorization: `Bearer ${guestToken}` },
+    { ...csrf, cookie: guestCookie },
     { currencyMode: 'SC', betPerBall: 1, rows: 12, risk: 'MEDIUM', ballCount: 1 }
   );
   assert.equal(guestScBlocked.status, 401);
 
-  // Register player -> gets 100,000 GC + 10.00 SC (unplayed)
+  // Register player -> HttpOnly cookie + 100,000 GC + 10.00 SC (unplayed)
   const reg = await router.handleRequest(
     'POST',
     '/api/auth/register',
-    {},
+    csrf,
     { email: 'player@blinko.test', password: 'Password123!', name: 'CouchDriver' }
   );
   assert.equal(reg.status, 201);
-  const token = reg.body.token;
+  assert.equal(reg.body.token, undefined);
+  const playerCookie = extractCookie(reg, 'blk_session');
+  assert.ok(playerCookie);
   assert.equal(reg.body.balance.sweepsCoins, 10);
   assert.equal(reg.body.balance.unplayedSC, 10);
   assert.equal(reg.body.balance.redeemableSC, 0);
@@ -135,20 +172,37 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const drop = await router.handleRequest(
     'POST',
     '/api/drop',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { currencyMode: 'SC', betPerBall: 1, rows: 12, risk: 'LOW', ballCount: 10, clientSeed: 'myseed123' }
   );
   assert.equal(drop.status, 200);
   assert.equal(drop.body.balls.length, 10);
   assert.equal(drop.body.balance.unplayedSC, 0);
 
-  // Verify drop deterministically via ACTIVE_DEMO
+  // Security: ACTIVE_DEMO oracle MUST be rejected!
+  const activeDemoBlocked = await router.handleRequest(
+    'POST',
+    '/api/provably-fair/verify',
+    csrf,
+    { serverSeed: 'ACTIVE_DEMO', clientSeed: 'myseed123', nonce: drop.body.provablyFair.nonce }
+  );
+  assert.equal(activeDemoBlocked.status, 400);
+
+  // Rotate user's own seed -> reveal previous seed -> verify prior drop deterministically
+  const rotated = await router.handleRequest(
+    'POST',
+    '/api/provably-fair/rotate',
+    { ...csrf, cookie: playerCookie }
+  );
+  assert.equal(rotated.status, 200);
+  assert.match(rotated.body.revealedServerSeed, /^[0-9a-f]{64}$/);
+
   const verify = await router.handleRequest(
     'POST',
     '/api/provably-fair/verify',
-    {},
+    csrf,
     {
-      serverSeed: 'ACTIVE_DEMO',
+      serverSeed: rotated.body.revealedServerSeed,
       clientSeed: 'myseed123',
       nonce: drop.body.provablyFair.nonce,
       rows: 12,
@@ -162,21 +216,31 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   assert.equal(verify.body.totalPayout, drop.body.totalWin);
 
   // Claim Daily & AMOE once; second claim same day returns 409
-  const daily1 = await router.handleRequest('POST', '/api/promotions/daily', { authorization: `Bearer ${token}` });
+  const daily1 = await router.handleRequest('POST', '/api/promotions/daily', { ...csrf, cookie: playerCookie });
   assert.equal(daily1.status, 200);
-  const daily2 = await router.handleRequest('POST', '/api/promotions/daily', { authorization: `Bearer ${token}` });
+  const daily2 = await router.handleRequest('POST', '/api/promotions/daily', { ...csrf, cookie: playerCookie });
   assert.equal(daily2.status, 409);
 
-  const amoe1 = await router.handleRequest('POST', '/api/promotions/amoe', { authorization: `Bearer ${token}` });
+  const amoe1 = await router.handleRequest('POST', '/api/promotions/amoe', { ...csrf, cookie: playerCookie });
   assert.equal(amoe1.status, 200);
-  const amoe2 = await router.handleRequest('POST', '/api/promotions/amoe', { authorization: `Bearer ${token}` });
+  const amoe2 = await router.handleRequest('POST', '/api/promotions/amoe', { ...csrf, cookie: playerCookie });
   assert.equal(amoe2.status, 409);
 
-  // Live Crypto deposit quote -> on-chain verify -> credit -> duplicate tx rejected
+  // Authenticated On-Ramp link builds MoonPay URL server-side
+  const onramp = await router.handleRequest(
+    'POST',
+    '/api/payments/onramp',
+    { ...csrf, cookie: playerCookie },
+    { packageId: 'pkg_faa_margarita' }
+  );
+  assert.equal(onramp.status, 200);
+  assert.ok(onramp.body.url.startsWith('https://www.moonpay.com/buy/usdt?walletAddress='));
+
+  // Live Crypto deposit quote -> on-chain verify -> credit
   const depCreate = await router.handleRequest(
     'POST',
     '/api/deposits/crypto',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { packageId: 'pkg_faa_margarita', asset: 'USDT_SOL' }
   );
   assert.equal(depCreate.status, 201);
@@ -186,22 +250,31 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const depSubmit = await router.handleRequest(
     'POST',
     '/api/deposits/crypto/submit',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { depositId: deposit.id, txHash: '5xValidSolanaSig1111111111111111111111111111111111111111111111111111' }
   );
   assert.equal(depSubmit.status, 200);
   assert.equal(depSubmit.body.credited, true);
 
-  // Admin Login
-  const admLogin = await router.handleRequest('POST', '/api/admin/login', {}, { adminKey: 'test-operator-secret' });
+  // Admin Login -> HttpOnly; Path=/api/admin cookie (no token in JSON)
+  const admLogin = await router.handleRequest('POST', '/api/admin/login', csrf, { adminKey: 'test-operator-secret' });
   assert.equal(admLogin.status, 200);
-  const adminToken = admLogin.body.token;
+  assert.equal(admLogin.body.token, undefined);
+  const adminCookie = extractCookie(admLogin, 'blk_admin');
+  assert.ok(adminCookie && admLogin.headers['Set-Cookie'][0].includes('Path=/api/admin'));
 
-  // Cash App order -> player sent -> admin confirms -> duplicate receipt rejected
+  // Player session cookie is ignored on /api/admin/ (401) and forged blk_admin with player token fails RBAC (403)
+  const privEscNoAdmin = await router.handleRequest('GET', '/api/admin/summary', { cookie: playerCookie });
+  assert.equal(privEscNoAdmin.status, 401);
+  const forgedAdminCookie = playerCookie.replace(/^blk_session=/, 'blk_admin=');
+  const privEscRbac = await router.handleRequest('GET', '/api/admin/summary', { cookie: forgedAdminCookie });
+  assert.equal(privEscRbac.status, 403);
+
+  // Cash App order -> player sent -> admin confirms
   const ordRes = await router.handleRequest(
     'POST',
     '/api/orders/cashapp',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { packageId: 'pkg_couch_starter', senderTag: '$PlayerTag' }
   );
   assert.equal(ordRes.status, 201);
@@ -210,28 +283,29 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   await router.handleRequest(
     'POST',
     '/api/orders/cashapp/sent',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { orderId: ordId, senderTag: '$PlayerTag' }
   );
 
   const admConf = await router.handleRequest(
     'POST',
     '/api/admin/orders/confirm',
-    { authorization: `Bearer ${adminToken}` },
+    { ...csrf, cookie: adminCookie },
     { orderId: ordId, cashAppPaymentId: 'CA-REC-9901' }
   );
   assert.equal(admConf.status, 200);
   assert.equal(admConf.body.order.status, 'confirmed');
 
-  // Stripe Checkout + Signed Webhook verification & credit
+  // Stripe Checkout MUST ignore spoofed client origin and use configured PUBLIC_ORIGIN
   const strChk = await router.handleRequest(
     'POST',
     '/api/payments/stripe/checkout',
-    { authorization: `Bearer ${token}`, origin: 'http://localhost:3002' },
-    { packageId: 'pkg_embassy_viral' }
+    { ...csrf, cookie: playerCookie },
+    { packageId: 'pkg_embassy_viral', origin: 'https://evil-attacker.example' }
   );
   assert.equal(strChk.status, 201);
-  assert.equal(strChk.body.stripeSessionId, 'cs_test_12345');
+  assert.ok(!lastStripeBody.includes('evil-attacker.example'));
+  assert.ok(lastStripeBody.includes(encodeURIComponent('https://blinkosweepstakes.oopsiwon.com')));
 
   const whPayload = JSON.stringify({
     id: 'evt_test_1',
@@ -258,7 +332,6 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   assert.equal(whRes.status, 200);
   assert.equal(whRes.body.handled, true);
 
-  // Duplicate Stripe event idempotency check
   const whDup = await router.handleRequest(
     'POST',
     '/api/payments/stripe/webhook',
@@ -272,12 +345,11 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   await router.handleRequest(
     'POST',
     '/api/admin/adjust-balance',
-    { authorization: `Bearer ${adminToken}` },
+    { ...csrf, cookie: adminCookie },
     { targetUserId: reg.body.user.id, currency: 'SC', amount: 1200, reason: 'Test rollover setup' }
   );
 
-  // Play through all unplayed SC via single drop
-  const balBeforePlay = await router.handleRequest('GET', '/api/balance', { authorization: `Bearer ${token}` });
+  const balBeforePlay = await router.handleRequest('GET', '/api/balance', { cookie: playerCookie });
   const unplayed = balBeforePlay.body.balance.unplayedSC;
   if (unplayed > 0) {
     await new Promise((r) => setTimeout(r, 75));
@@ -285,7 +357,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
     const playAll = await router.handleRequest(
       'POST',
       '/api/drop',
-      { authorization: `Bearer ${token}` },
+      { ...csrf, cookie: playerCookie },
       { currencyMode: 'SC', betPerBall: betPer, rows: 8, risk: 'LOW', ballCount: 10 }
     );
     assert.equal(playAll.status, 200, JSON.stringify(playAll.body));
@@ -295,7 +367,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const rdmBlocked = await router.handleRequest(
     'POST',
     '/api/redeem',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { amountSC: 50, method: 'crypto', cryptoAsset: 'USDT_SOL', destination: 'Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f' }
   );
   assert.equal(rdmBlocked.status, 403);
@@ -305,7 +377,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const kycRestricted = await router.handleRequest(
     'POST',
     '/api/kyc/submit',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { legalName: 'Jane Doe', dob: '1995-04-12', address: { line1: '1 Main', city: 'NY', state: 'NY', zip: '10001' } }
   );
   assert.equal(kycRestricted.status, 451);
@@ -314,7 +386,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const kycOk = await router.handleRequest(
     'POST',
     '/api/kyc/submit',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { legalName: 'Jane Doe', dob: '1995-04-12', address: { line1: '1 Main St', city: 'Austin', state: 'TX', zip: '78701' } }
   );
   assert.equal(kycOk.status, 200);
@@ -322,16 +394,16 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const kycApprove = await router.handleRequest(
     'POST',
     '/api/admin/kyc/decide',
-    { authorization: `Bearer ${adminToken}` },
+    { ...csrf, cookie: adminCookie },
     { userId: reg.body.user.id, decision: 'verified' }
   );
   assert.equal(kycApprove.status, 200);
 
-  // Live Crypto Payout: player requests -> operator quotes -> verifier checks outgoing txHash -> settled!
+  // Live Crypto Payout
   const rdmReq = await router.handleRequest(
     'POST',
     '/api/redeem',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     {
       amountSC: 50,
       method: 'crypto',
@@ -345,7 +417,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const quoteRes = await router.handleRequest(
     'POST',
     '/api/admin/redemptions/quote',
-    { authorization: `Bearer ${adminToken}` },
+    { ...csrf, cookie: adminCookie },
     { redemptionId: rdmId }
   );
   assert.equal(quoteRes.status, 200);
@@ -354,7 +426,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const paidRes = await router.handleRequest(
     'POST',
     '/api/admin/redemptions/mark-paid',
-    { authorization: `Bearer ${adminToken}` },
+    { ...csrf, cookie: adminCookie },
     {
       redemptionId: rdmId,
       txHash: '4yPayoutSolanaTxSig11111111111111111111111111111111111111111111111111',
@@ -367,7 +439,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const strPayout1 = await router.handleRequest(
     'POST',
     '/api/redeem',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { amountSC: 50, method: 'stripe_bank', destination: 'acct_player_123' }
   );
   assert.equal(strPayout1.status, 200, JSON.stringify(strPayout1.body));
@@ -390,7 +462,7 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   const strPayout2 = await router.handleRequest(
     'POST',
     '/api/redeem',
-    { authorization: `Bearer ${token}` },
+    { ...csrf, cookie: playerCookie },
     { amountSC: 50, method: 'stripe_bank', destination: 'acct_player_123' }
   );
   assert.equal(strPayout2.status, 200, JSON.stringify(strPayout2.body));
@@ -430,15 +502,10 @@ await test('Full Sweepstakes Flow + Live Payment Rails + SQLite Persistence', as
   assert.equal(disputeWh.status, 200);
 
   // Verify Merkle Audit Ledger integrity
-  const ledgerCheck = await router.handleRequest('GET', '/api/admin/ledger', { authorization: `Bearer ${adminToken}` });
+  const ledgerCheck = await router.handleRequest('GET', '/api/admin/ledger', { cookie: adminCookie });
   assert.equal(ledgerCheck.status, 200);
   assert.equal(ledgerCheck.body.integrity.valid, true);
   assert.ok(ledgerCheck.body.integrity.chainLength > 5);
-
-  // Seed rotation & tamper detection check
-  const rotRes = await router.handleRequest('POST', '/api/admin/provably-fair/rotate', { authorization: `Bearer ${adminToken}` });
-  assert.equal(rotRes.status, 200);
-  assert.ok(rotRes.body.revealedServerSeed);
 
   // Cleanup tmp sqlite file
   try {

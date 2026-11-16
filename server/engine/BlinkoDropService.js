@@ -5,9 +5,9 @@ import {
   BLINKO_BALL_COUNTS,
   BLINKO_MULTIPLIERS,
   BET_LIMITS,
-  MEME_CHARACTERS,
+  MEME_CHARACTER_IDS,
   BOARD_NEWS_BUMPERS,
-} from '../../src/config/blinkoConfig.js';
+} from '../config/gameConfig.js';
 import { ServerWallet } from './ServerWallet.js';
 
 export function hashSeed(seed) {
@@ -38,50 +38,70 @@ export function deriveBallPath(serverSeed, clientSeed, nonce, ballIndex, rows) {
 }
 
 export class BlinkoDropService {
-  constructor(wallet, ledger, store, options = {}) {
+  constructor(wallet, ledger, store) {
     this.wallet = wallet;
     this.ledger = ledger;
     this.store = store;
-    const savedSeed = store?.get('meta', 'blinko_server_seed');
-    this.serverSeed = options.serverSeed || savedSeed?.seed || generateServerSeed();
-    if (store && !savedSeed) {
-      store.put('meta', 'blinko_server_seed', { seed: this.serverSeed, updatedAt: new Date().toISOString() });
-    }
-    this.previousServerSeed = savedSeed?.previousServerSeed || null;
-    this.previousServerSeedHash = savedSeed?.previousServerSeedHash || null;
     this.lastDropTimestamps = new Map();
   }
 
-  getPublicCommitment() {
+  _getOrCreateUserSeed(userId) {
+    const key = `pf_seed:${userId}`;
+    let rec = this.store.get('meta', key);
+    if (!rec) {
+      rec = {
+        activeSeed: generateServerSeed(),
+        previousSeed: null,
+        previousSeedHash: null,
+        createdAt: new Date().toISOString(),
+      };
+      this.store.put('meta', key, rec);
+    }
+    return rec;
+  }
+
+  getUserCommitment(userId) {
+    const rec = this._getOrCreateUserSeed(userId);
     return {
-      serverSeedHash: hashSeed(this.serverSeed),
+      serverSeedHash: hashSeed(rec.activeSeed),
       algorithm: 'HMAC-SHA256',
-      previousServerSeed: this.previousServerSeed,
-      previousServerSeedHash: this.previousServerSeedHash,
+      previousServerSeed: rec.previousSeed || null,
+      previousServerSeedHash: rec.previousSeedHash || null,
     };
   }
 
-  rotateServerSeed() {
-    const revealedServerSeed = this.serverSeed;
-    const revealedServerSeedHash = hashSeed(revealedServerSeed);
-    this.previousServerSeed = revealedServerSeed;
-    this.previousServerSeedHash = revealedServerSeedHash;
-    this.serverSeed = generateServerSeed();
-    if (this.store) {
-      this.store.put('meta', 'blinko_server_seed', {
-        seed: this.serverSeed,
-        previousServerSeed: this.previousServerSeed,
-        previousServerSeedHash: this.previousServerSeedHash,
-        updatedAt: new Date().toISOString(),
+  rotateUserSeed(userId) {
+    return this.store.transaction(() => {
+      const key = `pf_seed:${userId}`;
+      const rec = this._getOrCreateUserSeed(userId);
+      const revealedServerSeed = rec.activeSeed;
+      const revealedServerSeedHash = hashSeed(revealedServerSeed);
+      const nextSeed = generateServerSeed();
+      const updated = {
+        activeSeed: nextSeed,
+        previousSeed: revealedServerSeed,
+        previousSeedHash: revealedServerSeedHash,
+        createdAt: rec.createdAt,
+        rotatedAt: new Date().toISOString(),
+      };
+      this.store.put('meta', key, updated);
+      this.ledger.append({
+        userId,
+        type: 'SEED_ROTATED',
+        currency: 'SYSTEM',
+        amount: 0,
+        balanceBefore: 0,
+        balanceAfter: 0,
+        metadata: { revealedServerSeedHash, newServerSeedHash: hashSeed(nextSeed) },
       });
-    }
-    return {
-      revealedServerSeed,
-      revealedServerSeedHash,
-      newServerSeedHash: hashSeed(this.serverSeed),
-      algorithm: 'HMAC-SHA256',
-      rotatedAt: new Date().toISOString(),
-    };
+      return {
+        revealedServerSeed,
+        revealedServerSeedHash,
+        newServerSeedHash: hashSeed(nextSeed),
+        algorithm: 'HMAC-SHA256',
+        rotatedAt: updated.rotatedAt,
+      };
+    });
   }
 
   _simulateBall({ serverSeed, clientSeed, nonce, ballIndex, rows, risk, betPerBall, isSC }) {
@@ -94,7 +114,6 @@ export class BlinkoDropService {
       ? ServerWallet.fromCents(Math.round(ServerWallet.toCents(betPerBall) * multiplier))
       : Math.round(betPerBall * multiplier);
 
-    // Check if the ball passes near any of the 3 funny current-event news bumpers
     const bumperHits = [];
     let colPos = 0;
     for (let r = 0; r < rows; r++) {
@@ -121,9 +140,16 @@ export class BlinkoDropService {
     };
   }
 
+  /**
+   * Pure offline/revealed verification — strictly rejects unrevealed live seeds or shortcuts.
+   */
   verifyDropOutcome({ serverSeed, clientSeed, nonce, rows = 12, risk = 'MEDIUM', ballCount = 1, betPerBall = 1, currencyMode = 'SC' }) {
-    if (!serverSeed || !clientSeed || typeof Number(nonce) !== 'number' || !Number.isFinite(Number(nonce))) {
-      throw new Error('serverSeed, clientSeed, and numeric nonce are required.');
+    const cleanSeed = String(serverSeed || '').trim();
+    if (!/^[0-9a-fA-F]{64}$/.test(cleanSeed)) {
+      throw new Error('Provide a valid 64-character revealed serverSeed (rotate your seed first to reveal prior drops).');
+    }
+    if (!clientSeed || !Number.isFinite(Number(nonce))) {
+      throw new Error('clientSeed and numeric nonce are required.');
     }
     const r = Number(rows);
     const rsk = String(risk || 'MEDIUM').toUpperCase();
@@ -132,14 +158,13 @@ export class BlinkoDropService {
     if (!BLINKO_RISKS.includes(rsk)) throw new Error(`Risk must be one of: ${BLINKO_RISKS.join(', ')}`);
     if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('ballCount must be 1-10');
 
-    const seedToUse = serverSeed === 'ACTIVE_DEMO' ? this.serverSeed : String(serverSeed);
     const isSC = currencyMode === 'SC';
     const balls = [];
     let totalPayoutCentsOrGc = 0;
 
     for (let i = 0; i < count; i++) {
       const b = this._simulateBall({
-        serverSeed: seedToUse,
+        serverSeed: cleanSeed,
         clientSeed,
         nonce: Number(nonce),
         ballIndex: i,
@@ -154,7 +179,7 @@ export class BlinkoDropService {
 
     return {
       verified: true,
-      serverSeedHash: hashSeed(seedToUse),
+      serverSeedHash: hashSeed(cleanSeed),
       clientSeed: String(clientSeed),
       nonce: Number(nonce),
       rows: r,
@@ -211,7 +236,8 @@ export class BlinkoDropService {
       : normalizedBet * count;
 
     const cSeed = clientSeed ? String(clientSeed).slice(0, 64) : crypto.randomBytes(12).toString('hex');
-    const charValid = MEME_CHARACTERS.find((c) => c.id === characterId) || MEME_CHARACTERS[0];
+    const validCharId = MEME_CHARACTER_IDS.includes(characterId) ? characterId : MEME_CHARACTER_IDS[0];
+    const seedRecord = this._getOrCreateUserSeed(userId);
 
     let dropOutcome = null;
     const settlement = this.wallet.settleDrop(userId, mode, totalBet, (nonce) => {
@@ -220,7 +246,7 @@ export class BlinkoDropService {
       let maxMultiplier = 0;
       for (let i = 0; i < count; i++) {
         const b = this._simulateBall({
-          serverSeed: this.serverSeed,
+          serverSeed: seedRecord.activeSeed,
           clientSeed: cSeed,
           nonce,
           ballIndex: i,
@@ -247,7 +273,7 @@ export class BlinkoDropService {
           risk: rsk,
           ballCount: count,
           betPerBall: normalizedBet,
-          characterId: charValid.id,
+          characterId: validCharId,
           maxMultiplier,
           buckets: balls.map((b) => b.bucketIndex),
           clientSeed: cSeed,
@@ -265,11 +291,11 @@ export class BlinkoDropService {
       totalBet,
       totalWin: settlement.winAmount,
       maxMultiplier: dropOutcome.maxMultiplier,
-      characterId: charValid.id,
+      characterId: validCharId,
       balls: dropOutcome.balls,
       balance: settlement.account,
       provablyFair: {
-        serverSeedHash: hashSeed(this.serverSeed),
+        serverSeedHash: hashSeed(seedRecord.activeSeed),
         clientSeed: cSeed,
         nonce: settlement.nonce,
         algorithm: 'HMAC-SHA256',

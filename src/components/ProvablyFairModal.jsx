@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, ShieldCheck, RefreshCw, CheckCircle2 } from 'lucide-react';
+import { X, ShieldCheck, RefreshCw, CheckCircle2, RotateCw } from 'lucide-react';
 import { apiClient } from '../services/apiClient';
 
 export default function ProvablyFairModal({
@@ -10,7 +10,7 @@ export default function ProvablyFairModal({
   prefillDrop,
 }) {
   const [commitment, setCommitment] = useState(null);
-  const [serverSeed, setServerSeed] = useState('ACTIVE_DEMO');
+  const [serverSeed, setServerSeed] = useState('');
   const [verifyClientSeed, setVerifyClientSeed] = useState(clientSeed || '');
   const [nonce, setNonce] = useState('1');
   const [rows, setRows] = useState('12');
@@ -24,7 +24,16 @@ export default function ProvablyFairModal({
 
   useEffect(() => {
     if (!isOpen) return;
-    apiClient.getProvablyFair().then(setCommitment).catch(() => {});
+    apiClient
+      .getProvablyFair()
+      .then((c) => {
+        setCommitment(c);
+        if (c?.previousServerSeed) {
+          setServerSeed((prev) => prev || c.previousServerSeed);
+        }
+      })
+      .catch(() => {});
+
     if (prefillDrop) {
       setVerifyClientSeed(prefillDrop.provablyFair?.clientSeed || clientSeed || '');
       setNonce(String(prefillDrop.provablyFair?.nonce || 1));
@@ -41,6 +50,25 @@ export default function ProvablyFairModal({
   }, [isOpen, prefillDrop, clientSeed]);
 
   if (!isOpen) return null;
+
+  const handleRotateSeed = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const res = await apiClient.rotateProvablyFair();
+      setCommitment({
+        serverSeedHash: res.newServerSeedHash,
+        previousServerSeed: res.revealedServerSeed,
+        previousServerSeedHash: res.revealedServerSeedHash,
+        algorithm: res.algorithm,
+      });
+      setServerSeed(res.revealedServerSeed);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleVerify = async (e) => {
     e.preventDefault();
@@ -89,7 +117,7 @@ export default function ProvablyFairModal({
               <ShieldCheck size={20} className="inline-icon" aria-hidden="true" /> Provably Fair HMAC-SHA256
             </h2>
             <p className="modal-sub">
-              Every peg bounce is derived deterministically from HMAC-SHA256(serverSeed, clientSeed:nonce:ballIndex).
+              Per-account server seeds commit via SHA-256 before drops. Rotate your seed anytime to reveal and verify prior drops.
             </p>
           </div>
           <button type="button" className="modal-close" onClick={onClose} aria-label="Close provably fair dialog">
@@ -99,19 +127,24 @@ export default function ProvablyFairModal({
 
         <div className="commitment-box">
           <div className="field">
-            <label htmlFor="active-server-hash">Active Server Seed SHA-256 Commitment</label>
-            <input
-              id="active-server-hash"
-              type="text"
-              readOnly
-              value={commitment?.serverSeedHash || 'Loading…'}
-              className="mono"
-            />
+            <label htmlFor="active-server-hash">Your Active Server Seed SHA-256 Commitment</label>
+            <div className="inline-input">
+              <input
+                id="active-server-hash"
+                type="text"
+                readOnly
+                value={commitment?.serverSeedHash || 'Loading…'}
+                className="mono"
+              />
+              <button type="button" className="btn-secondary" onClick={handleRotateSeed} disabled={busy}>
+                <RotateCw size={14} aria-hidden="true" /> Rotate &amp; Reveal
+              </button>
+            </div>
           </div>
 
           {commitment?.previousServerSeed && (
             <div className="field">
-              <label htmlFor="prev-server-seed">Last Revealed Server Seed (after rotation)</label>
+              <label htmlFor="prev-server-seed">Last Revealed Server Seed (for prior drops)</label>
               <input id="prev-server-seed" type="text" readOnly value={commitment.previousServerSeed} className="mono" />
             </div>
           )}
@@ -134,16 +167,18 @@ export default function ProvablyFairModal({
         </div>
 
         <form onSubmit={handleVerify} className="stack-form">
-          <h3>Verify Any Drop Outcome</h3>
+          <h3>Verify Past Drop Outcome</h3>
           <div className="form-grid-2">
             <div className="field">
-              <label htmlFor="vf-server-seed">Server Seed (or ACTIVE_DEMO)</label>
+              <label htmlFor="vf-server-seed">Revealed Server Seed (64-hex)</label>
               <input
                 id="vf-server-seed"
                 type="text"
+                placeholder="Click Rotate & Reveal above to get seed…"
                 value={serverSeed}
                 onChange={(e) => setServerSeed(e.target.value)}
                 className="mono"
+                required
               />
             </div>
             <div className="field">
@@ -154,11 +189,12 @@ export default function ProvablyFairModal({
                 value={verifyClientSeed}
                 onChange={(e) => setVerifyClientSeed(e.target.value)}
                 className="mono"
+                required
               />
             </div>
             <div className="field">
               <label htmlFor="vf-nonce">Account Nonce</label>
-              <input id="vf-nonce" type="number" value={nonce} onChange={(e) => setNonce(e.target.value)} />
+              <input id="vf-nonce" type="number" value={nonce} onChange={(e) => setNonce(e.target.value)} required />
             </div>
             <div className="field">
               <label htmlFor="vf-rows">Rows</label>

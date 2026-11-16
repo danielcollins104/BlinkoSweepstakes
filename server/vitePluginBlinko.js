@@ -55,9 +55,11 @@ export function blinkoApiPlugin() {
           req.on('end', async () => {
             try {
               const router = await getRouter();
+              const isSecure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
               const response = await router.handleRequest(req.method, pathname, req.headers, body, {
                 query: urlObj.searchParams,
                 ip: req.socket?.remoteAddress || '127.0.0.1',
+                isSecure,
               });
               res.statusCode = response.status;
               for (const [k, v] of Object.entries(response.headers)) {
@@ -67,7 +69,7 @@ export function blinkoApiPlugin() {
             } catch (err) {
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ error: err.message }));
+              res.end(JSON.stringify({ error: 'Internal server error' }));
             }
           });
         } else {

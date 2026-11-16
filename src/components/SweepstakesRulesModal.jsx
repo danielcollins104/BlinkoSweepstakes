@@ -1,8 +1,7 @@
 import React from 'react';
 import { X, Scale } from 'lucide-react';
-import { DEFAULT_RESTRICTED_STATES } from '../config/sweepstakesRulesClient';
 
-export default function SweepstakesRulesModal({ isOpen, onClose }) {
+export default function SweepstakesRulesModal({ isOpen, onClose, restrictedStates = [] }) {
   if (!isOpen) return null;
 
   return (
@@ -49,7 +48,7 @@ export default function SweepstakesRulesModal({ isOpen, onClose }) {
           <h3>3. Eligibility &amp; Restricted Jurisdictions</h3>
           <p>
             Open to legal US residents age 18+ (or 21+ where required by state law). Void where prohibited by law,
-            including: <strong>{DEFAULT_RESTRICTED_STATES.join(', ')}</strong>. Identity verification (KYC) is required
+            including: <strong>{restrictedStates.length ? restrictedStates.join(', ') : 'Restricted states loaded from server'}</strong>. Identity verification (KYC) is required
             prior to first prize payout.
           </p>
 

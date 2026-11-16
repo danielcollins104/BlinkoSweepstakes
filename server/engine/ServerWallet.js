@@ -1,4 +1,4 @@
-import { SWEEPSTAKES_CONFIG } from '../../src/config/sweepstakesConfig.js';
+import { SWEEPSTAKES_CONFIG } from '../config/sweepstakesConfig.js';
 
 /**
  * Server-Authoritative Atomic Dual-Currency Wallet (GC & Integer-Cent SC).

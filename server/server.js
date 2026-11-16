@@ -42,9 +42,11 @@ const server = http.createServer((req, res) => {
       if (body.length > 1e6) req.destroy();
     });
     req.on('end', async () => {
+      const isSecure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
       const response = await router.handleRequest(req.method, pathname, req.headers, body, {
         query: urlObj.searchParams,
         ip: req.socket?.remoteAddress || '127.0.0.1',
+        isSecure,
       });
       res.writeHead(response.status, response.headers);
       res.end(response.body !== null ? JSON.stringify(response.body) : undefined);
@@ -62,8 +64,10 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
       'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
       'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options': 'SAMEORIGIN',
+      'X-Frame-Options': 'DENY',
       'Referrer-Policy': 'strict-origin-when-cross-origin',
+      'Content-Security-Policy':
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com",
       'Cache-Control': pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
     });
     fs.createReadStream(filePath).pipe(res);

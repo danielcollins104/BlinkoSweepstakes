@@ -16,7 +16,6 @@ import {
   Loader2,
   AlertCircle,
 } from 'lucide-react';
-import { SWEEPSTAKES_CONFIG, calculateCustomPackage } from '../config/sweepstakesConfig';
 import { apiClient } from '../services/apiClient';
 import { soundEngine } from '../audio/soundEngine';
 import QrCodeImage from './QrCodeImage';
@@ -25,15 +24,21 @@ export default function CashierModal({
   isOpen,
   onClose,
   initialTab = 'store',
+  gameConfig,
   balance,
   user,
   onBalanceUpdate,
   onRequireAuth,
 }) {
+  const storePackages = gameConfig?.storePackages || [];
+  const highRollerPackages = gameConfig?.highRollerPackages || [];
+  const redemptionMethods = gameConfig?.redemptionMethods || [];
+  const giftCardBrands = gameConfig?.giftCardBrands || [];
+
   const [tab, setTab] = useState(initialTab);
   const [step, setStep] = useState(1); // 1 = select package, 2 = live payment rail
   const [tierView, setTierView] = useState('standard'); // 'standard' | 'highroller'
-  const [selectedPkg, setSelectedPkg] = useState(SWEEPSTAKES_CONFIG.storePackages[2]);
+  const [selectedPkg, setSelectedPkg] = useState(null);
   const [customAmount, setCustomAmount] = useState('25');
   const [rail, setRail] = useState('crypto'); // 'crypto' | 'cashapp' | 'card'
   const [config, setConfig] = useState(null);
@@ -105,6 +110,11 @@ export default function CashierModal({
 
   if (!isOpen) return null;
 
+  const activePkg =
+    selectedPkg ||
+    storePackages[2] ||
+    storePackages[0] || { id: 'pkg_custom', tierTitle: 'Custom Bundle', priceUsd: 25, isCustom: true };
+
   const copyText = (key, text) => {
     navigator.clipboard?.writeText(String(text)).catch(() => {});
     setCopiedKey(key);
@@ -125,13 +135,24 @@ export default function CashierModal({
     soundEngine.playButtonClick(580);
   };
 
+  const selectCustomPackage = () => {
+    const raw = Number(customAmount);
+    const num = Number(Math.max(1, Math.min(50000, Number.isFinite(raw) ? raw : 25)).toFixed(2));
+    selectPackage({
+      id: `pkg_custom_${num}`,
+      tierTitle: `Custom Headline Bundle ($${num.toFixed(2)})`,
+      priceUsd: num,
+      isCustom: true,
+    });
+  };
+
   const handleGenerateCryptoQuote = async () => {
     setBusy(true);
     setFeedback(null);
     try {
-      const payload = selectedPkg.isCustom
-        ? { packageId: selectedPkg.id, customAmountUsd: selectedPkg.priceUsd, asset: cryptoAsset }
-        : { packageId: selectedPkg.id, asset: cryptoAsset };
+      const payload = activePkg.isCustom
+        ? { packageId: activePkg.id, customAmountUsd: activePkg.priceUsd, asset: cryptoAsset }
+        : { packageId: activePkg.id, asset: cryptoAsset };
       const res = await apiClient.createCryptoDeposit(payload);
       setActiveDeposit(res.deposit);
       soundEngine.playButtonClick(640);
@@ -155,7 +176,9 @@ export default function CashierModal({
         soundEngine.playBucketLand(25);
         setFeedback({
           type: 'success',
-          message: `Verified on-chain! Credited ${selectedPkg.goldCoins.toLocaleString()} GC + ${selectedPkg.freeSweepsCoins.toFixed(2)} FREE SC.`,
+          message: `Verified on-chain! Credited ${Number(res.deposit.goldCoins).toLocaleString()} GC + ${Number(
+            res.deposit.freeSweepsCoins
+          ).toFixed(2)} FREE SC.`,
         });
       } else {
         setFeedback({
@@ -174,9 +197,9 @@ export default function CashierModal({
     setBusy(true);
     setFeedback(null);
     try {
-      const payload = selectedPkg.isCustom
-        ? { packageId: selectedPkg.id, customAmountUsd: selectedPkg.priceUsd, senderTag: senderTag.trim() || undefined }
-        : { packageId: selectedPkg.id, senderTag: senderTag.trim() || undefined };
+      const payload = activePkg.isCustom
+        ? { packageId: activePkg.id, customAmountUsd: activePkg.priceUsd, senderTag: senderTag.trim() || undefined }
+        : { packageId: activePkg.id, senderTag: senderTag.trim() || undefined };
       const res = await apiClient.createCashAppOrder(payload);
       setActiveOrder(res.order);
       soundEngine.playButtonClick(620);
@@ -210,12 +233,30 @@ export default function CashierModal({
     setBusy(true);
     setFeedback(null);
     try {
-      const payload = selectedPkg.isCustom
-        ? { packageId: selectedPkg.id, customAmountUsd: selectedPkg.priceUsd }
-        : { packageId: selectedPkg.id };
+      const payload = activePkg.isCustom
+        ? { packageId: activePkg.id, customAmountUsd: activePkg.priceUsd }
+        : { packageId: activePkg.id };
       const res = await apiClient.createStripeCheckout(payload);
       if (res.checkoutUrl) {
         window.location.assign(res.checkoutUrl);
+      }
+    } catch (err) {
+      setFeedback({ type: 'error', message: err.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleOpenOnramp = async () => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const payload = activePkg.isCustom
+        ? { packageId: activePkg.id, customAmountUsd: activePkg.priceUsd }
+        : { packageId: activePkg.id };
+      const res = await apiClient.createOnrampLink(payload);
+      if (res.url) {
+        window.open(res.url, '_blank', 'noopener,noreferrer');
       }
     } catch (err) {
       setFeedback({ type: 'error', message: err.message });
@@ -231,8 +272,8 @@ export default function CashierModal({
     try {
       const idem = `nmi_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const res = await apiClient.chargeNmiCard({
-        packageId: selectedPkg.id,
-        customAmountUsd: selectedPkg.isCustom ? selectedPkg.priceUsd : undefined,
+        packageId: activePkg.id,
+        customAmountUsd: activePkg.isCustom ? activePkg.priceUsd : undefined,
         paymentToken: nmiToken.trim(),
         idempotencyKey: idem,
       });
@@ -265,7 +306,7 @@ export default function CashierModal({
       soundEngine.playBucketLand(3);
       setFeedback({
         type: 'success',
-        message: 'Identity submitted! Operators can approve KYC instantly in the Operator Console (#admin).',
+        message: 'Identity submitted! An operator will verify your KYC shortly.',
       });
     } catch (err) {
       setFeedback({ type: 'error', message: err.message });
@@ -305,10 +346,8 @@ export default function CashierModal({
   const redeemableSc = Number(balance?.redeemableSC || 0);
   const playthroughPct = totalSc > 0 ? Math.min(100, Math.round((redeemableSc / totalSc) * 100)) : 100;
 
-  const solWallet = config?.crypto?.assets?.find((a) => a.id === 'USDT_SOL')?.address || '';
-  const moonpayUrl = `https://www.moonpay.com/buy/usdt?walletAddress=${encodeURIComponent(solWallet)}&baseCurrencyAmount=${encodeURIComponent(selectedPkg.priceUsd)}`;
-  const activeMethodObj = SWEEPSTAKES_CONFIG.redemptionMethods.find((m) => m.id === redeemMethod);
-  const packagesList = tierView === 'standard' ? SWEEPSTAKES_CONFIG.storePackages : SWEEPSTAKES_CONFIG.highRollerPackages;
+  const activeMethodObj = redemptionMethods.find((m) => m.id === redeemMethod);
+  const packagesList = tierView === 'standard' ? storePackages : highRollerPackages;
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
@@ -373,11 +412,7 @@ export default function CashierModal({
                   value={customAmount}
                   onChange={(e) => setCustomAmount(e.target.value)}
                 />
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={() => selectPackage(calculateCustomPackage(customAmount))}
-                >
+                <button type="button" className="btn-secondary" onClick={selectCustomPackage}>
                   Build ${Number(customAmount || 25).toFixed(2)}
                 </button>
               </div>
@@ -413,9 +448,15 @@ export default function CashierModal({
                 <ArrowLeft size={15} aria-hidden="true" /> Change Bundle
               </button>
               <div className="selected-summary">
-                <strong>{selectedPkg.tierTitle}</strong> —{' '}
-                <span>${selectedPkg.priceUsd.toFixed(2)} USD</span> ({selectedPkg.goldCoins.toLocaleString()} GC +{' '}
-                <strong>{selectedPkg.freeSweepsCoins.toFixed(2)} FREE SC</strong>)
+                <strong>{activePkg.tierTitle}</strong> —{' '}
+                <span>${activePkg.priceUsd.toFixed(2)} USD</span>
+                {!activePkg.isCustom && (
+                  <>
+                    {' '}
+                    ({activePkg.goldCoins.toLocaleString()} GC +{' '}
+                    <strong>{activePkg.freeSweepsCoins.toFixed(2)} FREE SC</strong>)
+                  </>
+                )}
               </div>
             </div>
 
@@ -424,7 +465,7 @@ export default function CashierModal({
                 <Bitcoin size={15} aria-hidden="true" /> On-Chain Crypto (Auto-Verify)
               </button>
               <button type="button" className={rail === 'cashapp' ? 'active' : ''} onClick={() => setRail('cashapp')}>
-                <DollarSign size={15} aria-hidden="true" /> Cash App ({config?.cashApp?.cashtag || '$Daniel-Collins-168'})
+                <DollarSign size={15} aria-hidden="true" /> Cash App P2P
               </button>
               <button type="button" className={rail === 'card' ? 'active' : ''} onClick={() => setRail('card')}>
                 <CreditCard size={15} aria-hidden="true" /> Card / Stripe / On-Ramp
@@ -601,13 +642,10 @@ export default function CashierModal({
                   {config?.stripe?.enabled ? (
                     <button type="button" className="btn-primary" onClick={handleStripeCheckout} disabled={busy}>
                       <CreditCard size={16} aria-hidden="true" />
-                      <span>Pay ${selectedPkg.priceUsd.toFixed(2)} via Stripe Checkout</span>
+                      <span>Pay ${activePkg.priceUsd.toFixed(2)} via Stripe Checkout</span>
                     </button>
                   ) : (
-                    <p className="modal-sub">
-                      Stripe Checkout endpoint is wired and ready — set <code>STRIPE_SECRET_KEY</code> in{' '}
-                      <code>.env.local</code> to activate live hosted card sessions.
-                    </p>
+                    <p className="modal-sub">Stripe Checkout is not configured on the server yet.</p>
                   )}
                 </div>
 
@@ -626,19 +664,19 @@ export default function CashierModal({
                       />
                     </div>
                     <button type="submit" className="btn-primary" disabled={busy}>
-                      Charge ${selectedPkg.priceUsd.toFixed(2)} via NMI
+                      Charge ${activePkg.priceUsd.toFixed(2)} via NMI
                     </button>
                   </form>
                 )}
 
                 <div className="card-option-box">
-                  <h3>Option C: Instant Card-to-USDC/USDT On-Ramp (No Merchant Keys Needed)</h3>
+                  <h3>Option C: Instant Card-to-USDT On-Ramp</h3>
                   <p className="modal-sub">
-                    Buy USDT directly to your player deposit address with Apple Pay, Google Pay, or debit card via MoonPay:
+                    Buy USDT directly to your player deposit wallet with Apple Pay, Google Pay, or debit card via MoonPay:
                   </p>
-                  <a href={moonpayUrl} target="_blank" rel="noreferrer" className="btn-secondary">
-                    <ExternalLink size={15} aria-hidden="true" /> Buy ${selectedPkg.priceUsd.toFixed(2)} USDT on MoonPay
-                  </a>
+                  <button type="button" className="btn-secondary" onClick={handleOpenOnramp} disabled={busy}>
+                    <ExternalLink size={15} aria-hidden="true" /> Buy ${activePkg.priceUsd.toFixed(2)} USDT on MoonPay
+                  </button>
                 </div>
               </div>
             )}
@@ -689,10 +727,7 @@ export default function CashierModal({
                       </h3>
                     </div>
                     {kycStatus.status === 'pending' ? (
-                      <p className="modal-sub">
-                        Your KYC submission is awaiting operator approval. Operators can approve immediately inside the
-                        Operator Payout Console (<code>#admin</code>).
-                      </p>
+                      <p className="modal-sub">Your KYC submission is awaiting operator approval.</p>
                     ) : (
                       <form onSubmit={handleKycSubmit} className="stack-form">
                         <div className="form-grid-2">
@@ -774,7 +809,7 @@ export default function CashierModal({
                 <form onSubmit={handleRedeemSubmit} className="redeem-form stack-form">
                   <h3>Request Live Prize Payout</h3>
                   <div className="method-grid">
-                    {SWEEPSTAKES_CONFIG.redemptionMethods.map((m) => (
+                    {redemptionMethods.map((m) => (
                       <button
                         key={m.id}
                         type="button"
@@ -813,7 +848,7 @@ export default function CashierModal({
                           value={giftCardBrand}
                           onChange={(e) => setGiftCardBrand(e.target.value)}
                         >
-                          {SWEEPSTAKES_CONFIG.giftCardBrands.map((b) => (
+                          {giftCardBrands.map((b) => (
                             <option key={b.id} value={b.id}>
                               {b.name} (+5%)
                             </option>

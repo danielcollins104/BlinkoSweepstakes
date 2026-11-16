@@ -1,4 +1,4 @@
-import { AuditLedger, resolveSecret } from './ledger/AuditLedger.js';
+import { AuditLedger } from './ledger/AuditLedger.js';
 import { ServerWallet } from './engine/ServerWallet.js';
 import { BlinkoDropService } from './engine/BlinkoDropService.js';
 import { AuthService } from './auth/AuthService.js';
@@ -21,9 +21,7 @@ export class BlinkoServer {
       welcomeGC: options.welcomeGC,
       welcomeSC: options.welcomeSC,
     });
-    this.dropService = new BlinkoDropService(this.wallet, this.ledger, this.store, {
-      serverSeed: options.serverSeed || env.DC_SPIN_SIGNING_KEY,
-    });
+    this.dropService = new BlinkoDropService(this.wallet, this.ledger, this.store);
     this.authService = new AuthService(this.store, this.ledger, {
       adminSecret: options.adminSecret || env.DC_ADMIN_SECRET,
     });
@@ -47,12 +45,14 @@ export class BlinkoServer {
     return this.authService.validateSession(token, requiredRole);
   }
 
-  getProvablyFairCommitment() {
-    return this.dropService.getPublicCommitment();
+  getProvablyFairCommitment(authToken) {
+    const session = this._authenticate(authToken);
+    return this.dropService.getUserCommitment(session.userId);
   }
 
-  rotateProvablyFairSeed() {
-    return this.dropService.rotateServerSeed();
+  rotateProvablyFairSeed(authToken) {
+    const session = this._authenticate(authToken);
+    return this.dropService.rotateUserSeed(session.userId);
   }
 
   verifyProvablyFairDrop(params) {

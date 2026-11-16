@@ -1,6 +1,6 @@
 import React from 'react';
 import { Radio } from 'lucide-react';
-import { BREAKING_NEWS_TICKER } from '../config/blinkoConfig';
+import { BREAKING_NEWS_TICKER } from '../config/memeCast';
 
 export default function BreakingNewsTicker({ liveFlash }) {
   const items = liveFlash ? [liveFlash, ...BREAKING_NEWS_TICKER] : BREAKING_NEWS_TICKER;

@@ -1,6 +1,7 @@
 import { BlinkoServer } from './BlinkoServer.js';
 import { checkGeo, assertGeo } from './compliance/compliance.js';
-import { SWEEPSTAKES_CONFIG } from '../src/config/sweepstakesConfig.js';
+import { SWEEPSTAKES_CONFIG, publicGameStoreConfig } from './config/sweepstakesConfig.js';
+import { publicBoardConfig } from './config/gameConfig.js';
 import { AuthService } from './auth/AuthService.js';
 
 class RateLimiter {
@@ -27,6 +28,38 @@ const RATE_RULES = [
   { match: /^\/api\//, limit: 600, windowMs: 60_000, by: 'ip' },
 ];
 
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  for (const part of String(header).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      if (k) {
+        try {
+          out[k] = decodeURIComponent(v);
+        } catch {
+          out[k] = v;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function buildCookie(name, value, pathScope, maxAgeSeconds, isSecure) {
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    `Path=${pathScope}`,
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (isSecure) parts.push('Secure');
+  return parts.join('; ');
+}
+
 export class ApiRouter {
   constructor(options = {}) {
     this.server = options.server || new BlinkoServer(options);
@@ -39,34 +72,48 @@ export class ApiRouter {
   }
 
   _cors(origin) {
-    let allow = '*';
-    if (this.allowedOrigins.length) {
-      allow = this.allowedOrigins.includes(origin) ? origin : this.allowedOrigins[0];
-    }
-    return {
-      'Access-Control-Allow-Origin': allow,
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Idempotency-Key, Stripe-Signature',
+    const headers = {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
       Vary: 'Origin',
     };
+    if (origin && this.allowedOrigins.includes(origin)) {
+      headers['Access-Control-Allow-Origin'] = origin;
+      headers['Access-Control-Allow-Credentials'] = 'true';
+      headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+      headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Requested-With, Idempotency-Key, Stripe-Signature';
+    }
+    return headers;
   }
 
   async handleRequest(method, path, headers = {}, body = {}, ctx = {}) {
     const h = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
     const cors = this._cors(h.origin || '');
-    const reply = (status, payload) => ({ status, headers: cors, body: payload });
+    const reply = (status, payload, cookiesToSet = null) => {
+      const resHeaders = { ...cors };
+      if (Array.isArray(cookiesToSet) && cookiesToSet.length > 0) {
+        resHeaders['Set-Cookie'] = cookiesToSet;
+      }
+      return { status, headers: resHeaders, body: payload };
+    };
     if (method === 'OPTIONS') return { status: 204, headers: cors, body: null };
 
+    const isSecure = Boolean(ctx.isSecure || String(h['x-forwarded-proto'] || '').toLowerCase() === 'https');
+    const cookies = parseCookies(h.cookie);
     const authHeader = h.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : authHeader.trim() || null;
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : null;
+    const isAdminRoute = path.startsWith('/api/admin/') && path !== '/api/admin/login' && path !== '/api/admin/logout';
+    const token = path.startsWith('/api/admin/')
+      ? cookies.blk_admin || bearerToken || null
+      : cookies.blk_session || bearerToken || null;
+
     const query = ctx.query instanceof URLSearchParams ? Object.fromEntries(ctx.query) : ctx.query || {};
     const geo = ctx.geo || {};
     const ip = ctx.ip || 'unknown';
     const rawBodyStr = typeof body === 'string' ? body : JSON.stringify(body || {});
 
-    // Stripe webhook receives raw string body + signature header
+    // Stripe webhook receives raw string body + signature header (no custom CSRF header from Stripe)
     if (path === '/api/payments/stripe/webhook' && method === 'POST') {
       try {
         const res = this.payments.handleStripeWebhook(rawBodyStr, h['stripe-signature']);
@@ -74,6 +121,11 @@ export class ApiRouter {
       } catch (err) {
         return reply(400, { error: err.message });
       }
+    }
+
+    // Strict CSRF header verification on all browser-invoked state-changing POST endpoints
+    if (method === 'POST' && h['x-requested-with'] !== 'BlinkoClient') {
+      return reply(403, { error: 'Forbidden: Missing CSRF verification header.' });
     }
 
     let b = {};
@@ -114,13 +166,21 @@ export class ApiRouter {
     }
 
     try {
-      // PUBLIC
+      // PUBLIC SAFE METADATA
       if (path === '/api/health') {
         return reply(200, {
           status: 'healthy',
           game: 'BLINKO: Headline Chaos 2026',
           storage: S.store.kind,
           timestamp: new Date().toISOString(),
+        });
+      }
+
+      if (path === '/api/game/config' && method === 'GET') {
+        return reply(200, {
+          success: true,
+          ...publicBoardConfig(),
+          ...publicGameStoreConfig(S.compliance),
         });
       }
 
@@ -133,35 +193,45 @@ export class ApiRouter {
       }
 
       if (path === '/api/provably-fair' && method === 'GET') {
-        return reply(200, { success: true, ...S.getProvablyFairCommitment() });
+        session();
+        return reply(200, { success: true, ...S.getProvablyFairCommitment(token) });
+      }
+
+      if (path === '/api/provably-fair/rotate' && method === 'POST') {
+        session();
+        return reply(200, { success: true, ...S.rotateProvablyFairSeed(token) });
       }
 
       if (path === '/api/provably-fair/verify' && method === 'POST') {
         return reply(200, { success: true, ...S.verifyProvablyFairDrop(b) });
       }
 
-      // AUTH
+      // AUTH (Sessions issued strictly as HttpOnly; SameSite=Strict cookies)
       if (path === '/api/auth/register' && method === 'POST') {
         const res = S.authService.registerUser({ email: b.email, password: b.password, name: b.name });
         const balance = S.wallet.getAccount(res.user.id);
-        return reply(201, { success: true, ...res, balance });
+        const cookie = buildCookie('blk_session', res.token, '/api', 24 * 60 * 60, isSecure);
+        return reply(201, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
       if (path === '/api/auth/login' && method === 'POST') {
         const res = S.authService.loginUser(b.email, b.password);
         const balance = S.wallet.getAccount(res.user.id);
-        return reply(200, { success: true, ...res, balance });
+        const cookie = buildCookie('blk_session', res.token, '/api', 24 * 60 * 60, isSecure);
+        return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
       if (path === '/api/auth/guest' && method === 'POST') {
         const res = S.authService.createGuestSession();
         const balance = S.wallet.getAccount(res.user.id, { isGuest: true });
-        return reply(200, { success: true, ...res, balance });
+        const cookie = buildCookie('blk_session', res.token, '/api', 7 * 24 * 60 * 60, isSecure);
+        return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
       if (path === '/api/auth/logout' && method === 'POST') {
         S.authService.revokeSession(token);
-        return reply(200, { success: true });
+        const clearCookie = buildCookie('blk_session', '', '/api', 0, isSecure);
+        return reply(200, { success: true }, [clearCookie]);
       }
 
       if (path === '/api/auth/me' && method === 'GET') {
@@ -185,13 +255,14 @@ export class ApiRouter {
 
       if (path === '/api/drop' && method === 'POST') {
         let activeToken = token;
-        let guestIssued = null;
+        let guestCookie = null;
         if (!activeToken) {
           if (String(b.currencyMode || '').toUpperCase() === 'SC') {
             return reply(401, { error: 'Sign in or create a free account to play with Sweeps Coins.' });
           }
-          guestIssued = S.authService.createGuestSession();
+          const guestIssued = S.authService.createGuestSession();
           activeToken = guestIssued.token;
+          guestCookie = buildCookie('blk_session', activeToken, '/api', 7 * 24 * 60 * 60, isSecure);
         }
         const s = S.authService.validateSession(activeToken);
         if (String(b.currencyMode || '').toUpperCase() === 'SC') {
@@ -201,11 +272,7 @@ export class ApiRouter {
           assertGeo(S.compliance, geo);
         }
         const result = S.handleDropRequest(activeToken, b);
-        return reply(200, {
-          success: true,
-          ...result,
-          token: guestIssued ? guestIssued.token : undefined,
-        });
+        return reply(200, { success: true, ...result }, guestCookie ? [guestCookie] : null);
       }
 
       if (path === '/api/promotions/daily' && method === 'POST') {
@@ -303,18 +370,24 @@ export class ApiRouter {
           },
           geo
         );
-        return reply(201, { success: true, order });
+        return reply(201, { success: true, order: P.publicOrder(order) });
       }
 
       if (path === '/api/orders/cashapp/sent' && method === 'POST') {
-        return reply(200, { success: true, order: P.markCashAppOrderSent(player(), b) });
+        const updated = P.markCashAppOrderSent(player(), b);
+        return reply(200, { success: true, order: P.publicOrder(updated) });
       }
 
       if (path === '/api/orders/mine' && method === 'GET') {
         return reply(200, { success: true, orders: P.listOrdersForUser(player()) });
       }
 
-      // CARD DEPOSITS (NMI + STRIPE)
+      // CARD / ON-RAMP / STRIPE DEPOSITS
+      if (path === '/api/payments/onramp' && method === 'POST') {
+        const link = P.createOnrampLink(player(), b, geo);
+        return reply(200, { success: true, ...link });
+      }
+
       if (path === '/api/payments/card/charge' && method === 'POST') {
         const res = await P.chargeCard(
           player(),
@@ -326,7 +399,7 @@ export class ApiRouter {
       }
 
       if (path === '/api/payments/stripe/checkout' && method === 'POST') {
-        const res = await P.createStripeCheckout(player(), { ...b, origin: h.origin || b.origin }, geo);
+        const res = await P.createStripeCheckout(player(), { ...b, isSecure }, geo);
         return reply(201, { success: true, ...res });
       }
 
@@ -355,11 +428,19 @@ export class ApiRouter {
 
       // ADMIN OPERATOR CONSOLE
       if (path === '/api/admin/login' && method === 'POST') {
-        return reply(200, { success: true, ...S.adminLogin(b.adminKey) });
+        const res = S.adminLogin(b.adminKey);
+        const cookie = buildCookie('blk_admin', res.token, '/api/admin', 4 * 60 * 60, isSecure);
+        return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt }, [cookie]);
       }
 
-      if (path.startsWith('/api/admin/')) {
-        if (!token) return reply(401, { error: 'Admin token required' });
+      if (path === '/api/admin/logout' && method === 'POST') {
+        S.authService.revokeSession(token);
+        const clearCookie = buildCookie('blk_admin', '', '/api/admin', 0, isSecure);
+        return reply(200, { success: true }, [clearCookie]);
+      }
+
+      if (isAdminRoute || path.startsWith('/api/admin/')) {
+        if (!token) return reply(401, { error: 'Admin authentication required' });
         const a = admin();
         const status = query.status || b.status;
         const limit = Math.min(500, Number(query.limit || b.limit) || 200);
@@ -440,7 +521,7 @@ export class ApiRouter {
             });
 
           case 'POST /api/admin/provably-fair/rotate':
-            return reply(200, { success: true, ...S.rotateProvablyFairSeed() });
+            return reply(200, { success: true, ...S.rotateProvablyFairSeed(token) });
 
           default:
             return reply(404, { error: `Endpoint not found: ${path}` });
@@ -455,7 +536,10 @@ export class ApiRouter {
         if (msg.startsWith('Unauthorized: Forbidden')) status = 403;
         else if (msg.startsWith('Unauthorized')) status = 401;
       }
-      if (status >= 500) console.error(`[API ERROR] ${path}:`, msg);
+      if (status >= 500) {
+        console.error(`[API ERROR] ${path}:`, msg);
+        return reply(status, { error: 'Internal server error', timestamp: new Date().toISOString() });
+      }
       return reply(status, { error: msg, code: err?.code || undefined, timestamp: new Date().toISOString() });
     }
   }

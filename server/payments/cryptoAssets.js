@@ -1,7 +1,7 @@
 // ============================================================================
 // CRYPTO ASSETS, RECEIVING ADDRESSES & LIVE MULTI-EXCHANGE PRICING ORACLE
 // ============================================================================
-import { CRYPTO_WALLET_ADDRESSES } from '../../src/config/sweepstakesConfig.js';
+import { CRYPTO_WALLET_ADDRESSES } from '../config/sweepstakesConfig.js';
 
 export const CRYPTO_ASSETS = {
   BTC: {

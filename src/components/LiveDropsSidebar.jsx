@@ -1,6 +1,6 @@
 import React from 'react';
 import { Gift, Mail, ShieldCheck, TrendingUp } from 'lucide-react';
-import { MEME_CHARACTERS } from '../config/blinkoConfig';
+import { MEME_CHARACTERS } from '../config/memeCast';
 
 export default function LiveDropsSidebar({
   balance,

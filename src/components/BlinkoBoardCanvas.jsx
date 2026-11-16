@@ -1,10 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import {
-  BLINKO_MULTIPLIERS,
-  MEME_CHARACTERS,
-  BOARD_NEWS_BUMPERS,
-  getBucketReaction,
-} from '../config/blinkoConfig';
+import { MEME_CHARACTERS, getBucketReaction } from '../config/memeCast';
 import { soundEngine } from '../audio/soundEngine';
 
 const MAX_ACTIVE_BALLS = 30;
@@ -23,6 +18,8 @@ function getBucketColor(mult) {
 export default function BlinkoBoardCanvas({
   rows = 12,
   risk = 'MEDIUM',
+  multipliers = {},
+  bumpers = [],
   dropQueue = [],
   onBallLanded,
   onClearQueue,
@@ -110,8 +107,8 @@ export default function BlinkoBoardCanvas({
       return { topPad, bottomPad, rowHeight, colSpacing, centerX, pegRadius, ballRadius, offsetToX, rowToY };
     };
 
-    // Precompute 3 funny bumper pegs for current row count
-    const bumperCoords = BOARD_NEWS_BUMPERS.map((b) => {
+    // Precompute 3 funny bumper pegs for current row count from server config
+    const bumperCoords = (bumpers || []).map((b) => {
       const r = Math.max(2, Math.min(rows - 2, Math.round(rows * b.rowRatio)));
       const colFloat = r / 2 + b.colOffset * (r * 0.45);
       const c = Math.max(0, Math.min(r, Math.round(colFloat)));
@@ -207,8 +204,8 @@ export default function BlinkoBoardCanvas({
         }
       }
 
-      // Draw bottom multiplier buckets
-      const mults = BLINKO_MULTIPLIERS[rows]?.[risk] || [];
+      // Draw bottom multiplier buckets from server config
+      const mults = multipliers?.[rows]?.[risk] || [];
       const bucketY = geom.rowToY(rows) + 4;
       const bucketW = Math.max(16, geom.colSpacing * 0.88);
       const bucketH = Math.min(38, geom.bottomPad - 16);
@@ -443,7 +440,7 @@ export default function BlinkoBoardCanvas({
       st.particles = [];
       st.bubbles = [];
     };
-  }, [rows, risk, onBallLanded]);
+  }, [rows, risk, multipliers, bumpers, onBallLanded]);
 
   return (
     <section className="board-stage" aria-label="Blinko game board">

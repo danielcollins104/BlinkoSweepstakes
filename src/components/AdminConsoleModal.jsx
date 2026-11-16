@@ -14,7 +14,7 @@ import { apiClient } from '../services/apiClient';
 import { soundEngine } from '../audio/soundEngine';
 
 export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveChanged }) {
-  const [unlocked, setUnlocked] = useState(() => Boolean(apiClient.getAdminToken()));
+  const [unlocked, setUnlocked] = useState(false);
   const [keyInput, setKeyInput] = useState('');
   const [tab, setTab] = useState('redemptions'); // 'redemptions' | 'kyc' | 'orders' | 'deposits' | 'tools'
   const [busy, setBusy] = useState(false);
@@ -47,7 +47,6 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
       setDeposits(dep.deposits || []);
     } catch (err) {
       if (err.status === 401 || err.status === 403) {
-        apiClient.setAdminToken(null);
         setUnlocked(false);
       }
       setToast({ type: 'error', message: err.message });
@@ -57,20 +56,15 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
   useEffect(() => {
     if (!isOpen) return;
     setToast(null);
-    if (apiClient.getAdminToken()) {
-      apiClient
-        .adminVerify()
-        .then(() => {
-          setUnlocked(true);
-          refreshAll();
-        })
-        .catch(() => {
-          apiClient.setAdminToken(null);
-          setUnlocked(false);
-        });
-    } else {
-      setUnlocked(false);
-    }
+    apiClient
+      .adminVerify()
+      .then(() => {
+        setUnlocked(true);
+        refreshAll();
+      })
+      .catch(() => {
+        setUnlocked(false);
+      });
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -92,8 +86,8 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
     }
   };
 
-  const handleLogout = () => {
-    apiClient.setAdminToken(null);
+  const handleLogout = async () => {
+    await apiClient.adminLogout().catch(() => {});
     setUnlocked(false);
   };
 

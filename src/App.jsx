@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import BreakingNewsTicker from './components/BreakingNewsTicker';
 import HeaderBar from './components/HeaderBar';
 import BlinkoBoardCanvas from './components/BlinkoBoardCanvas';
@@ -8,10 +8,11 @@ import AuthModal from './components/AuthModal';
 import CashierModal from './components/CashierModal';
 import ProvablyFairModal from './components/ProvablyFairModal';
 import SweepstakesRulesModal from './components/SweepstakesRulesModal';
-import AdminConsoleModal from './components/AdminConsoleModal';
-import { BET_LIMITS, MEME_CHARACTERS } from './config/blinkoConfig';
+import { MEME_CHARACTERS } from './config/memeCast';
 import { apiClient } from './services/apiClient';
 import { soundEngine } from './audio/soundEngine';
+
+const AdminConsoleModal = lazy(() => import('./components/AdminConsoleModal'));
 
 function makeRandomClientSeed() {
   const bytes = new Uint8Array(12);
@@ -21,9 +22,10 @@ function makeRandomClientSeed() {
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [gameConfig, setGameConfig] = useState(null);
   const [balance, setBalance] = useState({ goldCoins: 100000, sweepsCoins: 0, unplayedSC: 0, redeemableSC: 0 });
   const [currencyMode, setCurrencyMode] = useState('GC');
-  const [betPerBall, setBetPerBall] = useState(BET_LIMITS.GC.defaultBet);
+  const [betPerBall, setBetPerBall] = useState(500);
   const [rows, setRows] = useState(12);
   const [risk, setRisk] = useState('MEDIUM');
   const [ballCount, setBallCount] = useState(1);
@@ -47,7 +49,6 @@ export default function App() {
   const [showRules, setShowRules] = useState(false);
   const [showAdmin, setShowAdmin] = useState(() => window.location.hash === '#admin');
 
-  // Visual balance sync refs so payouts tick up as pucks hit buckets
   const authoritativeBalanceRef = useRef(null);
   const inFlightBallsRef = useRef(0);
   const pendingBatchesRef = useRef(new Map());
@@ -61,28 +62,25 @@ export default function App() {
     } catch {}
   }, []);
 
-  // Bootstrap session + check Stripe Checkout return params
+  // Bootstrap safe server config + HttpOnly cookie session + Stripe return check
   useEffect(() => {
     let active = true;
     const init = async () => {
       try {
-        let meRes = null;
-        if (apiClient.getToken()) {
-          try {
-            meRes = await apiClient.me();
-          } catch {
-            apiClient.setToken(null);
-          }
-        }
-        if (!meRes) {
-          meRes = await apiClient.guest();
-        }
+        const [cfgRes, meRes] = await Promise.all([
+          apiClient.getGameConfig(),
+          apiClient.me().catch(() => apiClient.guest()),
+        ]);
         if (!active) return;
+
+        setGameConfig(cfgRes);
+        if (cfgRes?.betLimits?.GC?.defaultBet) {
+          setBetPerBall(cfgRes.betLimits.GC.defaultBet);
+        }
         setUser(meRes.user);
         setBalance(meRes.balance);
         authoritativeBalanceRef.current = meRes.balance;
 
-        // Default registered players to SC if they have SC, or keep GC ready
         const params = new URLSearchParams(window.location.search);
         const stripeSessionId = params.get('stripe_session_id');
         const stripeRef = params.get('stripe_ref');
@@ -117,7 +115,8 @@ export default function App() {
       return;
     }
     setCurrencyMode(mode);
-    setBetPerBall(BET_LIMITS[mode].defaultBet);
+    const defaultBet = gameConfig?.betLimits?.[mode]?.defaultBet ?? (mode === 'SC' ? 1.0 : 500);
+    setBetPerBall(defaultBet);
     setBannerError('');
     soundEngine.playButtonClick(mode === 'SC' ? 660 : 520);
   };
@@ -153,7 +152,6 @@ export default function App() {
       inFlightBallsRef.current += res.balls.length;
       pendingBatchesRef.current.set(res.dropId, { remaining: res.balls.length, dropRecord: res });
 
-      // Immediately debit bet visually from displayed balance so suspense builds until buckets hit
       setBalance((prev) => ({
         ...prev,
         goldCoins:
@@ -228,7 +226,6 @@ export default function App() {
 
   const clearQueue = useCallback(() => setDropQueue([]), []);
 
-  // Auto-Drop loop
   useEffect(() => {
     if (!autoDrop) return undefined;
     const id = setInterval(() => {
@@ -237,7 +234,6 @@ export default function App() {
     return () => clearInterval(id);
   }, [autoDrop, ballCount, handleDrop]);
 
-  // Global keyboard shortcuts (Space to drop, Ctrl+Shift+A for admin)
   useEffect(() => {
     const onKeyDown = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
@@ -263,7 +259,7 @@ export default function App() {
     setBalance(res.balance);
     authoritativeBalanceRef.current = res.balance;
     setCurrencyMode('SC');
-    setBetPerBall(BET_LIMITS.SC.defaultBet);
+    setBetPerBall(gameConfig?.betLimits?.SC?.defaultBet ?? 1.0);
     setLiveFlash(`WELCOME ${res.user.name.toUpperCase()}! 10.00 FREE SC & 100,000 GC CREDITED!`);
   };
 
@@ -275,7 +271,7 @@ export default function App() {
     setBalance(g.balance);
     authoritativeBalanceRef.current = g.balance;
     setCurrencyMode('GC');
-    setBetPerBall(BET_LIMITS.GC.defaultBet);
+    setBetPerBall(gameConfig?.betLimits?.GC?.defaultBet ?? 500);
   };
 
   const handleClaimDaily = async () => {
@@ -340,7 +336,6 @@ export default function App() {
           setShowFair(true);
         }}
         onOpenRules={() => setShowRules(true)}
-        onOpenAdmin={() => setShowAdmin(true)}
         onLogout={handleLogout}
       />
 
@@ -355,6 +350,7 @@ export default function App() {
 
       <main className="arena-grid">
         <GameControls
+          gameConfig={gameConfig}
           currencyMode={currencyMode}
           betPerBall={betPerBall}
           onChangeBet={setBetPerBall}
@@ -376,6 +372,8 @@ export default function App() {
         <BlinkoBoardCanvas
           rows={rows}
           risk={risk}
+          multipliers={gameConfig?.multipliers}
+          bumpers={gameConfig?.bumpers}
           dropQueue={dropQueue}
           onBallLanded={handleBallLanded}
           onClearQueue={clearQueue}
@@ -405,6 +403,7 @@ export default function App() {
         isOpen={Boolean(cashierTab)}
         onClose={() => setCashierTab(null)}
         initialTab={cashierTab || 'store'}
+        gameConfig={gameConfig}
         balance={balance}
         user={user}
         onBalanceUpdate={(b) => {
@@ -425,13 +424,21 @@ export default function App() {
         prefillDrop={fairPrefill}
       />
 
-      <SweepstakesRulesModal isOpen={showRules} onClose={() => setShowRules(false)} />
-
-      <AdminConsoleModal
-        isOpen={showAdmin}
-        onClose={() => setShowAdmin(false)}
-        onBalanceMayHaveChanged={syncServerBalance}
+      <SweepstakesRulesModal
+        isOpen={showRules}
+        onClose={() => setShowRules(false)}
+        restrictedStates={gameConfig?.restrictedStates}
       />
+
+      {showAdmin && (
+        <Suspense fallback={null}>
+          <AdminConsoleModal
+            isOpen={showAdmin}
+            onClose={() => setShowAdmin(false)}
+            onBalanceMayHaveChanged={syncServerBalance}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

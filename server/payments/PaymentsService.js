@@ -3,7 +3,7 @@
 // & live prize payouts (Crypto On-Chain, Cash App, Gift Cards +5%, Stripe)
 // ============================================================================
 import crypto from 'node:crypto';
-import { SWEEPSTAKES_CONFIG, CASHTAG_HANDLE, calculateCustomPackage } from '../../src/config/sweepstakesConfig.js';
+import { SWEEPSTAKES_CONFIG, getCashtagHandle, calculateCustomPackage } from '../config/sweepstakesConfig.js';
 import { ServerWallet } from '../engine/ServerWallet.js';
 import {
   CRYPTO_ASSETS,
@@ -65,7 +65,7 @@ export class PaymentsService {
     this.verifier = deps.verifier || new CryptoVerifier({ env: this.env, fetchImpl: deps.fetchImpl });
     this.nmi = deps.nmi || new NmiGateway({ env: this.env, fetchImpl: deps.fetchImpl });
     this.stripe = deps.stripe || new StripeGateway({ env: this.env, fetchImpl: deps.fetchImpl });
-    this.cashtag = normalizeCashtag(this.env.CASHTAG || CASHTAG_HANDLE) || CASHTAG_HANDLE;
+    this.cashtag = normalizeCashtag(getCashtagHandle(this.env)) || '$Daniel-Collins-168';
   }
 
   resolvePackage(packageId, customAmountUsd = null) {
@@ -132,7 +132,7 @@ export class PaymentsService {
   publicConfig(geoCheck) {
     return {
       geo: geoCheck,
-      cashApp: { enabled: true, cashtag: this.cashtag },
+      cashApp: { enabled: true },
       card: this.nmi.publicConfig(),
       stripe: this.stripe.publicConfig(),
       crypto: {
@@ -143,7 +143,6 @@ export class PaymentsService {
           unit: a.unit,
           network: a.network,
           minConfirmations: a.minConfirmations,
-          address: getReceivingAddress(a, this.env),
         })),
       },
       redemption: {
@@ -153,6 +152,22 @@ export class PaymentsService {
         giftCardBonusRate: SWEEPSTAKES_CONFIG.giftCardBonusRate || 0.05,
         requireKyc: this.compliance.requireKycForRedemption,
       },
+    };
+  }
+
+  createOnrampLink(session, { packageId, customAmountUsd }, geo) {
+    this._requirePlayer(session);
+    assertGeo(this.compliance, geo);
+    const pkg = this.resolvePackage(packageId, customAmountUsd);
+    this._assertDepositLimits(session.userId, pkg.priceUsd);
+    const asset = getAsset('USDT_SOL');
+    const walletAddress = getReceivingAddress(asset, this.env);
+    if (!walletAddress) throw httpError('USDT receiving wallet is not configured.');
+    return {
+      provider: 'moonpay',
+      url: `https://www.moonpay.com/buy/usdt?walletAddress=${encodeURIComponent(walletAddress)}&baseCurrencyAmount=${encodeURIComponent(pkg.priceUsd)}`,
+      amountUsd: pkg.priceUsd,
+      packageId: pkg.id,
     };
   }
 
@@ -441,8 +456,31 @@ export class PaymentsService {
     return o;
   }
 
+  static _publicOrder(o) {
+    return {
+      id: o.id,
+      processorId: o.processorId,
+      orderRef: o.orderRef,
+      packageId: o.packageId,
+      amountUsd: o.amountUsd,
+      goldCoins: o.goldCoins,
+      freeSweepsCoins: o.freeSweepsCoins,
+      senderTag: o.senderTag,
+      payTo: o.payTo,
+      paymentLink: o.paymentLink,
+      status: o.status,
+      createdAt: o.createdAt,
+      sentAt: o.sentAt || null,
+      confirmedAt: o.confirmedAt || null,
+    };
+  }
+
+  publicOrder(o) {
+    return PaymentsService._publicOrder(o);
+  }
+
   listOrdersForUser(session, limit = 50) {
-    return this.store.find('orders', { k2: session.userId, limit });
+    return this.store.find('orders', { k2: session.userId, limit }).map(PaymentsService._publicOrder);
   }
 
   adminConfirmCashAppOrder(adminSession, { orderId, cashAppPaymentId, note = '' }) {
@@ -596,16 +634,25 @@ export class PaymentsService {
   // ---------------------------------------------------------------------------
   // CARD DEPOSITS — STRIPE CHECKOUT & WEBHOOKS
   // ---------------------------------------------------------------------------
-  async createStripeCheckout(session, { packageId, customAmountUsd, origin }, geo) {
+  async createStripeCheckout(session, { packageId, customAmountUsd, isSecure = false }, geo) {
     this._requirePlayer(session);
     assertGeo(this.compliance, geo);
     if (!this.stripe.enabled) {
-      throw httpError('Stripe checkout is not configured yet. Add STRIPE_SECRET_KEY in .env.local.', 503);
+      throw httpError('Stripe checkout is not configured yet.', 503);
     }
     const pkg = this.resolvePackage(packageId, customAmountUsd);
     this._assertDepositLimits(session.userId, pkg.priceUsd);
     const sessionRef = newId('str');
-    const baseOrigin = String(origin || 'http://localhost:3002').replace(/\/+$/, '');
+    const configuredOrigin =
+      this.env.PUBLIC_ORIGIN ||
+      String(this.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map((s) => s.trim())
+        .find(Boolean) ||
+      null;
+    const baseOrigin = String(
+      configuredOrigin || (isSecure ? 'https://blinkosweepstakes.oopsiwon.com' : `http://localhost:${this.env.PORT || 3002}`)
+    ).replace(/\/+$/, '');
     const stripeRes = await this.stripe.createCheckoutSession({
       sessionRef,
       packageTitle: pkg.tierTitle,

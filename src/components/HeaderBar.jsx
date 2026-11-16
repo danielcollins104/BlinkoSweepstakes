@@ -8,7 +8,6 @@ import {
   Volume2,
   VolumeX,
   User,
-  Lock,
   Scale,
   LogOut,
 } from 'lucide-react';
@@ -24,7 +23,6 @@ export default function HeaderBar({
   onOpenAuth,
   onOpenFair,
   onOpenRules,
-  onOpenAdmin,
   onLogout,
 }) {
   const isGuest = !user || user.role === 'GUEST';
@@ -145,16 +143,6 @@ export default function HeaderBar({
             </button>
           </div>
         )}
-
-        <button
-          type="button"
-          className="icon-btn admin-trigger"
-          onClick={onOpenAdmin}
-          aria-label="Open operator payout console"
-          title="Operator Payout Console (Ctrl+Shift+A)"
-        >
-          <Lock size={16} aria-hidden="true" />
-        </button>
       </nav>
     </header>
   );
