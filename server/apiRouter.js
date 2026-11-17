@@ -1,6 +1,10 @@
 import { BlinkoServer } from './BlinkoServer.js';
 import { checkGeo, assertGeo } from './compliance/compliance.js';
-import { SWEEPSTAKES_CONFIG, publicGameStoreConfig } from './config/sweepstakesConfig.js';
+import {
+  SWEEPSTAKES_CONFIG,
+  publicGameStoreConfig,
+  calculateCustomPackage,
+} from './config/sweepstakesConfig.js';
 import { publicBoardConfig } from './config/gameConfig.js';
 import { AuthService } from './auth/AuthService.js';
 
@@ -12,8 +16,13 @@ class RateLimiter {
     const now = Date.now();
     const w = this.windows.get(key);
     if (!w || now - w.start >= windowMs) {
+      if (this.windows.size > 50000) {
+        for (const [k, rec] of this.windows.entries()) {
+          if (now - rec.start >= windowMs) this.windows.delete(k);
+        }
+        if (this.windows.size > 50000) this.windows.clear();
+      }
       this.windows.set(key, { start: now, count: 1 });
-      if (this.windows.size > 50000) this.windows.clear();
       return true;
     }
     w.count++;
@@ -22,7 +31,8 @@ class RateLimiter {
 }
 
 const RATE_RULES = [
-  { match: /^\/api\/(auth\/(login|register)|admin\/login)$/, limit: 20, windowMs: 60_000, by: 'ip' },
+  { match: /^\/api\/auth\/register$/, limit: 8, windowMs: 10 * 60_000, by: 'ip' },
+  { match: /^\/api\/(auth\/login|admin\/login)$/, limit: 20, windowMs: 60_000, by: 'ip' },
   { match: /^\/api\/(deposits|orders|payments|redeem|kyc)/, limit: 45, windowMs: 60_000, by: 'user' },
   { match: /^\/api\/drop$/, limit: 300, windowMs: 60_000, by: 'user' },
   { match: /^\/api\//, limit: 600, windowMs: 60_000, by: 'ip' },
@@ -36,7 +46,7 @@ function parseCookies(header) {
     if (idx > 0) {
       const k = part.slice(0, idx).trim();
       const v = part.slice(idx + 1).trim();
-      if (k) {
+      if (k && k !== '__proto__' && k !== 'constructor' && k !== 'prototype') {
         try {
           out[k] = decodeURIComponent(v);
         } catch {
@@ -69,13 +79,21 @@ export class ApiRouter {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+    if (options.env?.PUBLIC_ORIGIN) {
+      const pub = String(options.env.PUBLIC_ORIGIN).trim().replace(/\/+$/, '');
+      if (pub && !this.allowedOrigins.includes(pub)) {
+        this.allowedOrigins.push(pub);
+      }
+    }
   }
 
   _cors(origin) {
     const headers = {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
       Vary: 'Origin',
     };
     if (origin && this.allowedOrigins.includes(origin)) {
@@ -87,7 +105,27 @@ export class ApiRouter {
     return headers;
   }
 
+  _verifySameOriginOrAllowed(h) {
+    const secFetchSite = String(h['sec-fetch-site'] || '').toLowerCase();
+    const origin = String(h.origin || '').trim();
+    if (secFetchSite === 'cross-site' && (!origin || !this.allowedOrigins.includes(origin))) {
+      return false;
+    }
+    if (origin && h.host) {
+      try {
+        const originUrl = new URL(origin);
+        if (originUrl.host !== String(h.host).trim() && !this.allowedOrigins.includes(origin)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
   async handleRequest(method, path, headers = {}, body = {}, ctx = {}) {
+    const upperMethod = String(method || 'GET').toUpperCase();
     const h = Object.fromEntries(Object.entries(headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));
     const cors = this._cors(h.origin || '');
     const reply = (status, payload, cookiesToSet = null) => {
@@ -97,11 +135,15 @@ export class ApiRouter {
       }
       return { status, headers: resHeaders, body: payload };
     };
-    if (method === 'OPTIONS') return { status: 204, headers: cors, body: null };
 
-    const isSecure = Boolean(ctx.isSecure || String(h['x-forwarded-proto'] || '').toLowerCase() === 'https');
+    if (upperMethod === 'OPTIONS') return { status: 204, headers: cors, body: null };
+    if (upperMethod !== 'GET' && upperMethod !== 'POST') {
+      return reply(405, { error: 'Method not allowed' });
+    }
+
+    const isSecure = Boolean(ctx.isSecure);
     const cookies = parseCookies(h.cookie);
-    const authHeader = h.authorization || '';
+    const authHeader = String(h.authorization || '');
     const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : null;
     const isAdminRoute = path.startsWith('/api/admin/') && path !== '/api/admin/login' && path !== '/api/admin/logout';
     const token = path.startsWith('/api/admin/')
@@ -114,7 +156,7 @@ export class ApiRouter {
     const rawBodyStr = typeof body === 'string' ? body : JSON.stringify(body || {});
 
     // Stripe webhook receives raw string body + signature header (no custom CSRF header from Stripe)
-    if (path === '/api/payments/stripe/webhook' && method === 'POST') {
+    if (path === '/api/payments/stripe/webhook' && upperMethod === 'POST') {
       try {
         const res = this.payments.handleStripeWebhook(rawBodyStr, h['stripe-signature']);
         return reply(200, { received: true, ...res });
@@ -123,14 +165,23 @@ export class ApiRouter {
       }
     }
 
-    // Strict CSRF header verification on all browser-invoked state-changing POST endpoints
-    if (method === 'POST' && h['x-requested-with'] !== 'BlinkoClient') {
-      return reply(403, { error: 'Forbidden: Missing CSRF verification header.' });
+    // Strict CSRF + Same-Origin verification on all browser-invoked state-changing POST endpoints
+    if (upperMethod === 'POST') {
+      if (h['x-requested-with'] !== 'BlinkoClient') {
+        return reply(403, { error: 'Forbidden: Missing CSRF verification header.' });
+      }
+      if (!this._verifySameOriginOrAllowed(h)) {
+        return reply(403, { error: 'Forbidden: Cross-origin state-changing request rejected.' });
+      }
     }
 
     let b = {};
     try {
-      b = typeof body === 'string' ? (body.length ? JSON.parse(body) : {}) : body || {};
+      const parsed = typeof body === 'string' ? (body.length ? JSON.parse(body) : {}) : body ?? {};
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return reply(400, { error: 'Invalid JSON object body' });
+      }
+      b = parsed;
     } catch {
       return reply(400, { error: 'Invalid JSON body' });
     }
@@ -167,7 +218,7 @@ export class ApiRouter {
 
     try {
       // PUBLIC SAFE METADATA
-      if (path === '/api/health') {
+      if (path === '/api/health' && upperMethod === 'GET') {
         return reply(200, {
           status: 'healthy',
           game: 'BLINKO: Headline Chaos 2026',
@@ -176,7 +227,7 @@ export class ApiRouter {
         });
       }
 
-      if (path === '/api/game/config' && method === 'GET') {
+      if (path === '/api/game/config' && upperMethod === 'GET') {
         return reply(200, {
           success: true,
           ...publicBoardConfig(),
@@ -184,57 +235,69 @@ export class ApiRouter {
         });
       }
 
-      if (path === '/api/payments/config' && method === 'GET') {
+      if (path === '/api/game/custom-package' && upperMethod === 'GET') {
+        const pkg = calculateCustomPackage(query.amountUsd);
+        return reply(200, { success: true, package: pkg });
+      }
+
+      if (path === '/api/payments/config' && upperMethod === 'GET') {
         return reply(200, { success: true, ...P.publicConfig(checkGeo(S.compliance, geo)) });
       }
 
-      if (path === '/api/geo' && method === 'GET') {
+      if (path === '/api/geo' && upperMethod === 'GET') {
         return reply(200, { success: true, ...checkGeo(S.compliance, geo) });
       }
 
-      if (path === '/api/provably-fair' && method === 'GET') {
+      if (path === '/api/provably-fair' && upperMethod === 'GET') {
         session();
         return reply(200, { success: true, ...S.getProvablyFairCommitment(token) });
       }
 
-      if (path === '/api/provably-fair/rotate' && method === 'POST') {
+      if (path === '/api/provably-fair/rotate' && upperMethod === 'POST') {
         session();
         return reply(200, { success: true, ...S.rotateProvablyFairSeed(token) });
       }
 
-      if (path === '/api/provably-fair/verify' && method === 'POST') {
+      if (path === '/api/provably-fair/verify' && upperMethod === 'POST') {
         return reply(200, { success: true, ...S.verifyProvablyFairDrop(b) });
       }
 
       // AUTH (Sessions issued strictly as HttpOnly; SameSite=Strict cookies)
-      if (path === '/api/auth/register' && method === 'POST') {
-        const res = S.authService.registerUser({ email: b.email, password: b.password, name: b.name });
-        const balance = S.wallet.getAccount(res.user.id);
+      if (path === '/api/auth/register' && upperMethod === 'POST') {
+        const priorFromIp = S.authService.countRecentIpRegistrations(ip);
+        const allowWelcomeSC = priorFromIp < 2 && checkGeo(S.compliance, geo).allowed;
+        const res = S.authService.registerUser({
+          email: b.email,
+          password: b.password,
+          name: b.name,
+          ip,
+        });
+        const balance = S.wallet.getAccount(res.user.id, { allowWelcomeSC });
         const cookie = buildCookie('blk_session', res.token, '/api', 24 * 60 * 60, isSecure);
         return reply(201, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
-      if (path === '/api/auth/login' && method === 'POST') {
+      if (path === '/api/auth/login' && upperMethod === 'POST') {
         const res = S.authService.loginUser(b.email, b.password);
         const balance = S.wallet.getAccount(res.user.id);
         const cookie = buildCookie('blk_session', res.token, '/api', 24 * 60 * 60, isSecure);
         return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
-      if (path === '/api/auth/guest' && method === 'POST') {
+      if (path === '/api/auth/guest' && upperMethod === 'POST') {
         const res = S.authService.createGuestSession();
         const balance = S.wallet.getAccount(res.user.id, { isGuest: true });
         const cookie = buildCookie('blk_session', res.token, '/api', 7 * 24 * 60 * 60, isSecure);
         return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt, balance }, [cookie]);
       }
 
-      if (path === '/api/auth/logout' && method === 'POST') {
+      if (path === '/api/auth/logout' && upperMethod === 'POST') {
         S.authService.revokeSession(token);
         const clearCookie = buildCookie('blk_session', '', '/api', 0, isSecure);
         return reply(200, { success: true }, [clearCookie]);
       }
 
-      if (path === '/api/auth/me' && method === 'GET') {
+      if (path === '/api/auth/me' && upperMethod === 'GET') {
         const s = session();
         const user =
           s.role === 'GUEST'
@@ -248,16 +311,17 @@ export class ApiRouter {
       }
 
       // WALLET & BLINKO GAME
-      if (path === '/api/balance' && (method === 'GET' || method === 'POST')) {
+      if (path === '/api/balance' && (upperMethod === 'GET' || upperMethod === 'POST')) {
         if (!token) return reply(401, { error: 'Authentication required' });
         return reply(200, { success: true, balance: S.getBalance(token) });
       }
 
-      if (path === '/api/drop' && method === 'POST') {
+      if (path === '/api/drop' && upperMethod === 'POST') {
         let activeToken = token;
         let guestCookie = null;
+        const reqCurrency = typeof b.currencyMode === 'string' ? b.currencyMode.toUpperCase() : 'GC';
         if (!activeToken) {
-          if (String(b.currencyMode || '').toUpperCase() === 'SC') {
+          if (reqCurrency === 'SC') {
             return reply(401, { error: 'Sign in or create a free account to play with Sweeps Coins.' });
           }
           const guestIssued = S.authService.createGuestSession();
@@ -265,7 +329,7 @@ export class ApiRouter {
           guestCookie = buildCookie('blk_session', activeToken, '/api', 7 * 24 * 60 * 60, isSecure);
         }
         const s = S.authService.validateSession(activeToken);
-        if (String(b.currencyMode || '').toUpperCase() === 'SC') {
+        if (reqCurrency === 'SC') {
           if (s.role === 'GUEST') {
             return reply(401, { error: 'Sign in or create a free account to play with Sweeps Coins.' });
           }
@@ -275,7 +339,7 @@ export class ApiRouter {
         return reply(200, { success: true, ...result }, guestCookie ? [guestCookie] : null);
       }
 
-      if (path === '/api/promotions/daily' && method === 'POST') {
+      if (path === '/api/promotions/daily' && upperMethod === 'POST') {
         const s = session();
         const day = new Date().toISOString().slice(0, 10);
         const reward = SWEEPSTAKES_CONFIG.dailyReward || { goldCoins: 10000, sweepsCoins: 1.0 };
@@ -294,13 +358,16 @@ export class ApiRouter {
           });
         } catch (err) {
           if (err.code === 'DUPLICATE') {
-            return reply(409, { error: 'Daily bonus already claimed today! Come back tomorrow.', nextClaimAt: `${day}T23:59:59Z` });
+            return reply(409, {
+              error: 'Daily bonus already claimed today! Come back tomorrow.',
+              nextClaimAt: `${day}T23:59:59Z`,
+            });
           }
           throw err;
         }
       }
 
-      if (path === '/api/promotions/amoe' && method === 'POST') {
+      if (path === '/api/promotions/amoe' && upperMethod === 'POST') {
         const s = player();
         assertGeo(S.compliance, geo);
         const day = new Date().toISOString().slice(0, 10);
@@ -325,24 +392,24 @@ export class ApiRouter {
         }
       }
 
-      if (path === '/api/ledger/user' && (method === 'GET' || method === 'POST')) {
+      if (path === '/api/ledger/user' && (upperMethod === 'GET' || upperMethod === 'POST')) {
         if (!token) return reply(401, { error: 'Authentication required' });
         const limit = Math.min(200, Number(b.limit || query.limit) || 50);
         return reply(200, { success: true, history: S.getUserAuditHistory(token, limit) });
       }
 
       // CRYPTO DEPOSITS
-      if (path === '/api/deposits/crypto' && method === 'POST') {
+      if (path === '/api/deposits/crypto' && upperMethod === 'POST') {
         const dep = await P.createCryptoDeposit(player(), b, geo);
         return reply(201, { success: true, deposit: dep });
       }
 
-      if (path === '/api/deposits/crypto/submit' && method === 'POST') {
+      if (path === '/api/deposits/crypto/submit' && upperMethod === 'POST') {
         const res = await P.submitCryptoTx(player(), { depositId: b.depositId, txHash: b.txHash });
         return reply(200, { success: true, ...res });
       }
 
-      if (path === '/api/deposits/crypto/status' && (method === 'POST' || method === 'GET')) {
+      if (path === '/api/deposits/crypto/status' && (upperMethod === 'POST' || upperMethod === 'GET')) {
         const s = player();
         const id = b.depositId || query.depositId;
         const d = P.getDepositForUser(s, id);
@@ -350,17 +417,22 @@ export class ApiRouter {
           const res = await P.submitCryptoTx(s, { depositId: id, txHash: d.txHash });
           return reply(200, { success: true, ...res });
         }
-        return reply(200, { success: true, deposit: P._publicDeposit(d) });
+        return reply(200, {
+          success: true,
+          deposit: P._publicDeposit(d),
+          credited: d.status === 'credited',
+          balance: d.status === 'credited' ? S.wallet.getAccount(s.userId) : undefined,
+        });
       }
 
-      if (path === '/api/deposits/crypto/mine' && method === 'GET') {
+      if (path === '/api/deposits/crypto/mine' && upperMethod === 'GET') {
         const s = player();
         const deps = S.store.find('deposits', { k2: s.userId, limit: 50 }).map((d) => P._publicDeposit(d));
         return reply(200, { success: true, deposits: deps });
       }
 
       // CASH APP DEPOSITS
-      if ((path === '/api/orders/cashapp' || path === '/api/orders') && method === 'POST') {
+      if ((path === '/api/orders/cashapp' || path === '/api/orders') && upperMethod === 'POST') {
         const order = P.createCashAppOrder(
           player(),
           {
@@ -373,22 +445,27 @@ export class ApiRouter {
         return reply(201, { success: true, order: P.publicOrder(order) });
       }
 
-      if (path === '/api/orders/cashapp/sent' && method === 'POST') {
+      if (path === '/api/orders/cashapp/sent' && upperMethod === 'POST') {
         const updated = P.markCashAppOrderSent(player(), b);
         return reply(200, { success: true, order: P.publicOrder(updated) });
       }
 
-      if (path === '/api/orders/mine' && method === 'GET') {
+      if (path === '/api/orders/cashapp/status' && (upperMethod === 'GET' || upperMethod === 'POST')) {
+        const res = P.getOrderForUser(player(), b.orderId || query.orderId);
+        return reply(200, { success: true, ...res });
+      }
+
+      if (path === '/api/orders/mine' && upperMethod === 'GET') {
         return reply(200, { success: true, orders: P.listOrdersForUser(player()) });
       }
 
       // CARD / ON-RAMP / STRIPE DEPOSITS
-      if (path === '/api/payments/onramp' && method === 'POST') {
+      if (path === '/api/payments/onramp' && upperMethod === 'POST') {
         const link = P.createOnrampLink(player(), b, geo);
         return reply(200, { success: true, ...link });
       }
 
-      if (path === '/api/payments/card/charge' && method === 'POST') {
+      if (path === '/api/payments/card/charge' && upperMethod === 'POST') {
         const res = await P.chargeCard(
           player(),
           { ...b, idempotencyKey: b.idempotencyKey || h['idempotency-key'] },
@@ -398,42 +475,42 @@ export class ApiRouter {
         return reply(200, { success: res.charge.status === 'approved', ...res });
       }
 
-      if (path === '/api/payments/stripe/checkout' && method === 'POST') {
+      if (path === '/api/payments/stripe/checkout' && upperMethod === 'POST') {
         const res = await P.createStripeCheckout(player(), { ...b, isSecure }, geo);
         return reply(201, { success: true, ...res });
       }
 
-      if (path === '/api/payments/stripe/confirm' && method === 'POST') {
+      if (path === '/api/payments/stripe/confirm' && upperMethod === 'POST') {
         const res = await P.confirmStripeSession(player(), b);
         return reply(200, { success: true, ...res });
       }
 
       // KYC & PAYOUTS
-      if (path === '/api/kyc/submit' && method === 'POST') {
+      if (path === '/api/kyc/submit' && upperMethod === 'POST') {
         return reply(200, { success: true, ...P.submitKyc(player(), b, geo) });
       }
 
-      if (path === '/api/kyc/status' && method === 'GET') {
+      if (path === '/api/kyc/status' && upperMethod === 'GET') {
         return reply(200, { success: true, ...P.getKycStatus(player()) });
       }
 
-      if (path === '/api/redeem' && method === 'POST') {
+      if (path === '/api/redeem' && upperMethod === 'POST') {
         const res = P.requestRedemption(player(), b, geo);
         return reply(200, { success: true, ...res });
       }
 
-      if (path === '/api/redemptions/mine' && method === 'GET') {
+      if (path === '/api/redemptions/mine' && upperMethod === 'GET') {
         return reply(200, { success: true, redemptions: P.listRedemptionsForUser(player()) });
       }
 
       // ADMIN OPERATOR CONSOLE
-      if (path === '/api/admin/login' && method === 'POST') {
+      if (path === '/api/admin/login' && upperMethod === 'POST') {
         const res = S.adminLogin(b.adminKey);
         const cookie = buildCookie('blk_admin', res.token, '/api/admin', 4 * 60 * 60, isSecure);
         return reply(200, { success: true, user: res.user, expiresAt: res.expiresAt }, [cookie]);
       }
 
-      if (path === '/api/admin/logout' && method === 'POST') {
+      if (path === '/api/admin/logout' && upperMethod === 'POST') {
         S.authService.revokeSession(token);
         const clearCookie = buildCookie('blk_admin', '', '/api/admin', 0, isSecure);
         return reply(200, { success: true }, [clearCookie]);
@@ -445,7 +522,7 @@ export class ApiRouter {
         const status = query.status || b.status;
         const limit = Math.min(500, Number(query.limit || b.limit) || 200);
 
-        switch (`${method} ${path}`) {
+        switch (`${upperMethod} ${path}`) {
           case 'GET /api/admin/verify':
             return reply(200, {
               success: true,

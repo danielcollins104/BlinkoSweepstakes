@@ -11,6 +11,8 @@ import {
   getReceivingAddress,
   usdToDisplayUnits,
   displayUnitsToString,
+  parseDisplayUnits,
+  displayToChainUnits,
   chainToDisplayUnits,
   PriceOracle,
 } from './cryptoAssets.js';
@@ -40,10 +42,17 @@ function httpError(message, status = 400, code = null) {
   return e;
 }
 
+function assertScalar(val, label) {
+  if (val !== undefined && val !== null && typeof val === 'object') {
+    throw httpError(`Invalid ${label} parameter.`);
+  }
+}
+
 export function normalizeCashtag(tag) {
-  const t = String(tag || '').trim();
+  if (typeof tag !== 'string') return null;
+  const t = tag.trim();
   const clean = t.startsWith('$') ? t.slice(1) : t;
-  if (!/^[A-Za-z][A-Za-z0-9_-]{0,20}$/.test(clean)) return null;
+  if (!/^(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/.test(clean)) return null;
   return `$${clean}`;
 }
 
@@ -75,6 +84,8 @@ export class PaymentsService {
   }
 
   resolvePackage(packageId, customAmountUsd = null) {
+    assertScalar(packageId, 'packageId');
+    assertScalar(customAmountUsd, 'customAmountUsd');
     const all = [
       ...(SWEEPSTAKES_CONFIG.storePackages || []),
       ...(SWEEPSTAKES_CONFIG.highRollerPackages || []),
@@ -91,7 +102,7 @@ export class PaymentsService {
     }
     const amt = Number(customAmountUsd);
     if (String(packageId || '').startsWith('pkg_custom') || amt > 0) {
-      if (!(amt >= 1)) throw httpError('Custom amount must be at least $1.00');
+      if (!Number.isFinite(amt) || amt < 1) throw httpError('Custom amount must be at least $1.00');
       const c = calculateCustomPackage(amt);
       return {
         id: c.id,
@@ -99,6 +110,8 @@ export class PaymentsService {
         priceUsd: c.priceUsd,
         goldCoins: c.goldCoins,
         freeSweepsCoins: c.freeSweepsCoins,
+        badge: c.badge,
+        tagline: c.tagline,
         isCustom: true,
       };
     }
@@ -138,7 +151,7 @@ export class PaymentsService {
   publicConfig(geoCheck) {
     return {
       geo: geoCheck,
-      cashApp: { enabled: true },
+      cashApp: { enabled: Boolean(this.cashtag) },
       card: this.nmi.publicConfig(),
       stripe: this.stripe.publicConfig(),
       crypto: {
@@ -183,9 +196,12 @@ export class PaymentsService {
   async createCryptoDeposit(session, { packageId, customAmountUsd, asset: assetId }, geo) {
     this._requirePlayer(session);
     assertGeo(this.compliance, geo);
+    assertScalar(assetId, 'asset');
     const asset = getAsset(assetId || 'USDT_SOL');
     const address = getReceivingAddress(asset, this.env);
-    if (!address) throw httpError(`${asset.label} receiving wallet is not configured.`);
+    if (!address || !CryptoVerifier.isValidAddress(asset, address)) {
+      throw httpError(`${asset.label} receiving wallet is not configured.`);
+    }
     const pkg = this.resolvePackage(packageId, customAmountUsd);
     this._assertDepositLimits(session.userId, pkg.priceUsd);
 
@@ -265,16 +281,33 @@ export class PaymentsService {
     };
   }
 
+  /**
+   * Standards-compliant BIP-21 / EIP-681 / Solana Pay QR URI builder.
+   * Uses exact integer chain units for ETH (wei) and ERC-20 (base units) to avoid wallet scientific-notation bugs.
+   */
   static walletUri(asset, address, amount) {
-    if (asset.chain === 'bitcoin') return `bitcoin:${address}?amount=${amount}`;
-    if (asset.id === 'ETH') return `ethereum:${address}?value=${amount}e18`;
-    if (asset.id === 'USDT_ERC20') return `ethereum:${asset.tokenContract}/transfer?address=${address}&uint256=${amount}e6`;
-    if (asset.id === 'USDT_SOL') return `solana:${address}?amount=${amount}&spl-token=${asset.tokenMint}`;
-    return `solana:${address}?amount=${amount}`;
+    if (asset.chain === 'bitcoin') {
+      return `bitcoin:${address}?amount=${amount}`;
+    }
+    if (asset.id === 'ETH') {
+      const displayUnits = parseDisplayUnits(amount, asset.displayDecimals);
+      const wei = displayToChainUnits(displayUnits, asset);
+      return `ethereum:${address}@1?value=${wei.toString()}`;
+    }
+    if (asset.id === 'USDT_ERC20') {
+      const displayUnits = parseDisplayUnits(amount, asset.displayDecimals);
+      const rawUnits = displayToChainUnits(displayUnits, asset);
+      return `ethereum:${asset.tokenContract}@1/transfer?address=${address}&uint256=${rawUnits.toString()}`;
+    }
+    if (asset.id === 'USDT_SOL') {
+      return `solana:${address}?amount=${amount}&spl-token=${asset.tokenMint}&label=Blinko`;
+    }
+    return `solana:${address}?amount=${amount}&label=Blinko`;
   }
 
   getDepositForUser(session, depositId) {
-    const d = this.store.get('deposits', depositId);
+    assertScalar(depositId, 'depositId');
+    const d = this.store.get('deposits', String(depositId || ''));
     if (!d || (d.userId !== session.userId && session.role !== 'ADMIN')) {
       throw httpError('Deposit not found', 404);
     }
@@ -283,11 +316,13 @@ export class PaymentsService {
 
   async submitCryptoTx(session, { depositId, txHash }) {
     this._requirePlayer(session);
+    assertScalar(depositId, 'depositId');
+    assertScalar(txHash, 'txHash');
     const d = this.getDepositForUser(session, depositId);
     if (d.status === 'credited') {
       return { deposit: this._publicDeposit(d), credited: false, alreadyCredited: true };
     }
-    if (['rejected', 'needs_review'].includes(d.status)) {
+    if (['rejected', 'needs_review', 'expired'].includes(d.status)) {
       return { deposit: this._publicDeposit(d), credited: false };
     }
     const hash = String(txHash || d.txHash || '').trim();
@@ -296,7 +331,7 @@ export class PaymentsService {
       throw httpError('A different transaction was already submitted for this deposit.');
     }
 
-    if (d.lastCheckAt && Date.now() - Date.parse(d.lastCheckAt) < 10000) {
+    if (d.lastCheckAt && Date.now() - Date.parse(d.lastCheckAt) < 8000) {
       return { deposit: this._publicDeposit(d), credited: false, throttled: true };
     }
     const asset = getAsset(d.asset);
@@ -313,20 +348,33 @@ export class PaymentsService {
       if (cur.status === 'credited') {
         return { deposit: this._publicDeposit(cur), credited: false, alreadyCredited: true };
       }
-      cur.txHash = hash;
-      cur.lastCheckAt = new Date().toISOString();
+      const expiresMs = Date.parse(cur.expiresAt);
+      const isQuoteExpired = Number.isFinite(expiresMs) && Date.now() > expiresMs;
 
       if (!result.found) {
+        if (isQuoteExpired && !cur.txHash && !result.retryable) {
+          cur.status = 'expired';
+          cur.message = 'This 60-minute crypto quote expired before payment was detected. Generate a fresh quote.';
+          this.store.put('deposits', cur.id, cur);
+          return { deposit: this._publicDeposit(cur), credited: false };
+        }
+        cur.txHash = hash;
+        cur.lastCheckAt = new Date().toISOString();
         cur.message = result.error || 'Transaction not found on-chain yet — wait a moment and re-check.';
         this.store.put('deposits', cur.id, cur);
         return { deposit: this._publicDeposit(cur), credited: false };
       }
+
+      cur.txHash = hash;
+      cur.lastCheckAt = new Date().toISOString();
+
       if (result.success === false) {
         cur.status = 'rejected';
         cur.message = result.error || 'Transaction failed on-chain.';
         this.store.put('deposits', cur.id, cur);
         return { deposit: this._publicDeposit(cur), credited: false };
       }
+
       const createdMs = Date.parse(cur.createdAt);
       if (result.blockTime && result.blockTime * 1000 < createdMs - 10 * 60 * 1000) {
         cur.status = 'needs_review';
@@ -334,16 +382,36 @@ export class PaymentsService {
         this.store.put('deposits', cur.id, cur);
         return { deposit: this._publicDeposit(cur), credited: false };
       }
-      const receivedDisplay = chainToDisplayUnits(result.amountRaw, asset);
-      cur.receivedUnits = receivedDisplay.toString();
-      cur.confirmations = result.confirmations;
-      if (receivedDisplay === 0n && result.pending) {
-        cur.status = 'awaiting_payment';
-        cur.message = 'Transaction seen in mempool — waiting for confirmation.';
+
+      // Prevent spot-price lock option exploit on volatile assets if paid well after 60-minute window
+      if (
+        isQuoteExpired &&
+        asset.priceKey !== 'USD' &&
+        (!result.blockTime || result.blockTime * 1000 > expiresMs + 15 * 60 * 1000)
+      ) {
+        cur.status = 'needs_review';
+        cur.message = 'Transfer arrived after the 60-minute spot-price lock expired. Flagged for operator review.';
         this.store.put('deposits', cur.id, cur);
         return { deposit: this._publicDeposit(cur), credited: false };
       }
-      if (receivedDisplay !== BigInt(cur.expectedUnits)) {
+
+      const receivedDisplay = chainToDisplayUnits(result.amountRaw, asset);
+      cur.receivedUnits = receivedDisplay.toString();
+      cur.confirmations = result.confirmations;
+      if ((receivedDisplay === 0n && result.pending) || result.pending) {
+        if (receivedDisplay === 0n) {
+          cur.status = 'awaiting_payment';
+          cur.message = 'Transaction seen in mempool — waiting for block confirmation.';
+          this.store.put('deposits', cur.id, cur);
+          return { deposit: this._publicDeposit(cur), credited: false };
+        }
+      }
+
+      const expected = BigInt(cur.expectedUnits);
+      const minAcceptable = (expected * 998n) / 1000n;
+      const maxAcceptable = (expected * 1050n) / 1000n;
+
+      if (receivedDisplay < minAcceptable || receivedDisplay > maxAcceptable) {
         cur.status = 'needs_review';
         cur.message = `Received ${displayUnitsToString(receivedDisplay, asset.displayDecimals)} ${asset.unit}, expected ${cur.amountDisplay} ${asset.unit}. Flagged for operator review.`;
         this.store.put('deposits', cur.id, cur);
@@ -388,6 +456,8 @@ export class PaymentsService {
   }
 
   adminResolveCryptoDeposit(adminSession, { depositId, action, note = '' }) {
+    assertScalar(depositId, 'depositId');
+    assertScalar(action, 'action');
     return this.store.transaction(() => {
       const d = this.store.get('deposits', depositId);
       if (!d) throw httpError('Deposit not found', 404);
@@ -395,7 +465,7 @@ export class PaymentsService {
       if (action === 'credit') {
         if (!d.txHash) throw httpError('No transaction hash attached.');
         const asset = getAsset(d.asset);
-        d.operatorNote = note;
+        d.operatorNote = String(note || '').slice(0, 300);
         const creditRes = this._creditDeposit(
           d,
           `tx:${asset.chain}:${d.txHash.toLowerCase()}`,
@@ -406,7 +476,7 @@ export class PaymentsService {
       }
       if (action === 'reject') {
         d.status = 'rejected';
-        d.operatorNote = note;
+        d.operatorNote = String(note || '').slice(0, 300);
         d.reviewedBy = adminSession.userId;
         this.store.put('deposits', d.id, d);
         return { deposit: d };
@@ -421,13 +491,13 @@ export class PaymentsService {
   createCashAppOrder(session, { packageId, customAmountUsd, senderTag }, geo) {
     this._requirePlayer(session);
     assertGeo(this.compliance, geo);
+    assertScalar(senderTag, 'senderTag');
     const pkg = this.resolvePackage(packageId, customAmountUsd);
     this._assertDepositLimits(session.userId, pkg.priceUsd);
-    const sender = senderTag ? normalizeCashtag(senderTag) : null;
+    const sender = senderTag ? normalizeCashtag(String(senderTag)) : null;
     if (senderTag && !sender) throw httpError('Enter a valid $Cashtag (letters, numbers, - or _).');
     const orderRef = randomRef('BLK');
     const amount = Number(pkg.priceUsd);
-    const formatted = amount % 1 === 0 ? String(amount) : amount.toFixed(2);
     const order = {
       id: newId('ord'),
       processorId: 'cashapp',
@@ -439,8 +509,9 @@ export class PaymentsService {
       goldCoins: pkg.goldCoins,
       freeSweepsCoins: pkg.freeSweepsCoins,
       senderTag: sender,
+      customerReceiptRef: null,
       payTo: this.cashtag,
-      paymentLink: `https://cash.app/${this.cashtag}/${formatted}?note=${encodeURIComponent(orderRef)}`,
+      paymentLink: `https://cash.app/${this.cashtag}`,
       status: 'awaiting_payment',
       createdAt: new Date().toISOString(),
     };
@@ -448,18 +519,38 @@ export class PaymentsService {
     return order;
   }
 
-  markCashAppOrderSent(session, { orderId, senderTag }) {
+  markCashAppOrderSent(session, { orderId, senderTag, receiptRef }) {
     this._requirePlayer(session);
-    const o = this.store.get('orders', orderId);
+    assertScalar(orderId, 'orderId');
+    assertScalar(senderTag, 'senderTag');
+    assertScalar(receiptRef, 'receiptRef');
+    const o = this.store.get('orders', String(orderId || ''));
     if (!o || o.userId !== session.userId) throw httpError('Order not found', 404);
-    if (o.status !== 'awaiting_payment') return o;
-    const sender = normalizeCashtag(senderTag || o.senderTag);
-    if (!sender) throw httpError('Enter the $Cashtag you paid from so we can match the receipt.');
+    if (!['awaiting_payment', 'awaiting_confirmation'].includes(o.status)) return o;
+    const rawSender = senderTag !== undefined && senderTag !== '' ? String(senderTag) : o.senderTag;
+    const sender = rawSender ? normalizeCashtag(rawSender) : null;
+    if (!sender) throw httpError('Enter the $Cashtag you paid from so we can match your payment.');
     o.senderTag = sender;
+    if (typeof receiptRef === 'string' && receiptRef.trim()) {
+      o.customerReceiptRef = receiptRef.trim().slice(0, 160);
+    }
     o.status = 'awaiting_confirmation';
-    o.sentAt = new Date().toISOString();
+    o.sentAt = o.sentAt || new Date().toISOString();
     this.store.put('orders', o.id, o);
     return o;
+  }
+
+  getOrderForUser(session, orderId) {
+    this._requirePlayer(session);
+    assertScalar(orderId, 'orderId');
+    const o = this.store.get('orders', String(orderId || ''));
+    if (!o || (o.userId !== session.userId && session.role !== 'ADMIN')) {
+      throw httpError('Order not found', 404);
+    }
+    return {
+      order: PaymentsService._publicOrder(o),
+      balance: o.status === 'confirmed' ? this.wallet.getAccount(o.userId) : undefined,
+    };
   }
 
   static _publicOrder(o) {
@@ -472,6 +563,7 @@ export class PaymentsService {
       goldCoins: o.goldCoins,
       freeSweepsCoins: o.freeSweepsCoins,
       senderTag: o.senderTag,
+      customerReceiptRef: o.customerReceiptRef || null,
       payTo: o.payTo,
       paymentLink: o.paymentLink,
       status: o.status,
@@ -490,6 +582,8 @@ export class PaymentsService {
   }
 
   adminConfirmCashAppOrder(adminSession, { orderId, cashAppPaymentId, note = '' }) {
+    assertScalar(orderId, 'orderId');
+    assertScalar(cashAppPaymentId, 'cashAppPaymentId');
     const receipt = String(cashAppPaymentId || '').trim();
     if (receipt.length < 4) throw httpError('Enter the Cash App receipt/payment ID (4+ chars).');
     return this.store.transaction(() => {
@@ -519,7 +613,7 @@ export class PaymentsService {
         confirmedAt: new Date().toISOString(),
         confirmedBy: adminSession.userId,
         cashAppPaymentId: receipt,
-        operatorNote: note,
+        operatorNote: String(note || '').slice(0, 300),
         credit: { goldCoins: credit.goldCoins, sweepsCoins: credit.sweepsCoins },
       });
       this.store.put('orders', o.id, o);
@@ -528,12 +622,13 @@ export class PaymentsService {
   }
 
   adminRejectOrder(adminSession, { orderId, note = '' }) {
+    assertScalar(orderId, 'orderId');
     const o = this.store.get('orders', orderId);
     if (!o) throw httpError('Order not found', 404);
     if (o.status === 'confirmed') throw httpError('Order already confirmed.');
     Object.assign(o, {
       status: 'rejected',
-      operatorNote: note,
+      operatorNote: String(note || '').slice(0, 300),
       rejectedBy: adminSession.userId,
       rejectedAt: new Date().toISOString(),
     });
@@ -550,6 +645,8 @@ export class PaymentsService {
     if (!this.nmi.enabled) {
       throw httpError('NMI card gateway is not configured yet. Use Stripe, Crypto, or Cash App.', 503);
     }
+    assertScalar(idempotencyKey, 'idempotencyKey');
+    assertScalar(paymentToken, 'paymentToken');
     const key = String(idempotencyKey || '').trim();
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(key)) throw httpError('Missing valid idempotency key.');
     const pkg = this.resolvePackage(packageId, customAmountUsd);
@@ -575,7 +672,7 @@ export class PaymentsService {
       amountUsd: pkg.priceUsd,
       paymentToken,
       orderId: chargeId,
-      billing,
+      billing: billing && typeof billing === 'object' ? billing : {},
       ipAddress: ip,
       email: session.email,
     });
@@ -630,6 +727,7 @@ export class PaymentsService {
   }
 
   async adminReconcileCard(adminSession, { chargeId }) {
+    assertScalar(chargeId, 'chargeId');
     const c = this.store.get('card_charges', chargeId);
     if (!c) throw httpError('Charge not found', 404);
     if (!['unknown', 'processing'].includes(c.status)) return { charge: c };
@@ -718,6 +816,8 @@ export class PaymentsService {
 
   async confirmStripeSession(session, { sessionRef, stripeSessionId }) {
     this._requirePlayer(session);
+    assertScalar(sessionRef, 'sessionRef');
+    assertScalar(stripeSessionId, 'stripeSessionId');
     const rec = sessionRef
       ? this.store.get('stripe_sessions', sessionRef)
       : this.store.find('stripe_sessions', { k2: session.userId, limit: 50 }).find((s) => s.stripeSessionId === stripeSessionId);
@@ -870,17 +970,27 @@ export class PaymentsService {
   submitKyc(session, { legalName, dob, address = {}, phone }, geo) {
     this._requirePlayer(session);
     assertGeo(this.compliance, geo);
+    assertScalar(legalName, 'legalName');
+    assertScalar(dob, 'dob');
+    assertScalar(phone, 'phone');
+    if (!address || typeof address !== 'object' || Array.isArray(address)) {
+      throw httpError('Enter your full US residential address.');
+    }
     const user = this.auth.getUserById(session.userId);
     if (!user) throw httpError('User not found', 404);
     if (user.kycStatus === 'verified') return { status: 'verified' };
-    const name = String(legalName || '').trim();
+    const name = String(legalName || '').trim().slice(0, 120);
     if (name.length < 3 || !name.includes(' ')) throw httpError('Enter your full legal first and last name.');
     const state = String(address.state || '').trim().toUpperCase();
     if (!/^[A-Z]{2}$/.test(state)) throw httpError('Enter your 2-letter US state code.');
     if (this.compliance.restrictedStates.includes(state)) {
       throw httpError(`Prize redemptions are not available in ${state}.`, 451);
     }
-    if (!String(address.line1 || '').trim() || !String(address.city || '').trim() || !/^\d{5}(-\d{4})?$/.test(String(address.zip || '').trim())) {
+    if (
+      !String(address.line1 || '').trim() ||
+      !String(address.city || '').trim() ||
+      !/^\d{5}(-\d{4})?$/.test(String(address.zip || '').trim())
+    ) {
       throw httpError('Enter your full US residential address (street, city, ZIP).');
     }
     const age = ageOn(dob);
@@ -888,21 +998,31 @@ export class PaymentsService {
     const minAge = minAgeFor(this.compliance, state);
     if (age < minAge) throw httpError(`You must be at least ${minAge} years old to redeem prizes.`, 403);
 
-    const identityKey = crypto.createHash('sha256').update(`${name.toLowerCase().replace(/\s+/g, ' ')}|${dob}`).digest('hex');
+    const identityKey = crypto
+      .createHash('sha256')
+      .update(`${name.toLowerCase().replace(/\s+/g, ' ')}|${dob}`)
+      .digest('hex');
     const dupes = this.store.find('kyc', { k2: identityKey, limit: 10 }).filter((k) => k.userId !== session.userId);
+    if (dupes.some((d) => d.status === 'verified')) {
+      throw httpError(
+        'An account with this verified identity already exists. Sweepstakes rules permit one account per player.',
+        409,
+        'DUPLICATE_IDENTITY'
+      );
+    }
     const rec = {
       userId: session.userId,
       email: user.email,
       legalName: name,
-      dob,
+      dob: String(dob),
       address: {
-        line1: String(address.line1).trim(),
-        line2: String(address.line2 || '').trim(),
-        city: String(address.city).trim(),
+        line1: String(address.line1).trim().slice(0, 160),
+        line2: String(address.line2 || '').trim().slice(0, 160),
+        city: String(address.city).trim().slice(0, 80),
         state,
         zip: String(address.zip).trim(),
       },
-      phone: phone ? String(phone).trim() : null,
+      phone: phone ? String(phone).trim().slice(0, 32) : null,
       identityKey,
       duplicateOf: dupes.map((d) => d.userId),
       status: 'pending',
@@ -922,11 +1042,21 @@ export class PaymentsService {
   }
 
   adminDecideKyc(adminSession, { userId, decision, note = '' }) {
+    assertScalar(userId, 'userId');
+    assertScalar(decision, 'decision');
     if (!['verified', 'rejected'].includes(decision)) throw httpError('decision must be verified or rejected');
     const rec = this.store.get('kyc', userId);
     if (!rec) throw httpError('No KYC submission for this user', 404);
+    if (decision === 'verified' && rec.identityKey) {
+      const existingVerified = this.store
+        .find('kyc', { k2: rec.identityKey, limit: 10 })
+        .some((k) => k.userId !== userId && k.status === 'verified');
+      if (existingVerified) {
+        throw httpError('Another account with this identity is already KYC verified.', 409);
+      }
+    }
     rec.status = decision;
-    rec.decisionNote = note;
+    rec.decisionNote = String(note || '').slice(0, 300);
     rec.decidedBy = adminSession.userId;
     rec.decidedAt = new Date().toISOString();
     this.store.transaction(() => {
@@ -951,6 +1081,12 @@ export class PaymentsService {
   requestRedemption(session, { amountSC, method, destination, cryptoAsset, giftCardBrand }, geo) {
     this._requirePlayer(session);
     assertGeo(this.compliance, geo);
+    assertScalar(amountSC, 'amountSC');
+    assertScalar(method, 'method');
+    assertScalar(destination, 'destination');
+    assertScalar(cryptoAsset, 'cryptoAsset');
+    assertScalar(giftCardBrand, 'giftCardBrand');
+
     const m = String(method || '').toLowerCase();
     const normalizedMethod =
       m === 'chime' || m === 'cashapp'
@@ -990,13 +1126,14 @@ export class PaymentsService {
       dest = normalizeCashtag(dest);
       if (!dest) throw httpError('Enter a valid $Cashtag.');
     } else if (normalizedMethod === 'giftcard') {
-      brand = String(giftCardBrand || 'visa_virtual');
+      const validBrands = new Set((SWEEPSTAKES_CONFIG.giftCardBrands || []).map((b) => b.id));
+      brand = validBrands.has(String(giftCardBrand)) ? String(giftCardBrand) : 'visa_virtual';
       dest = dest || user?.email;
       if (!dest || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(dest)) {
         throw httpError('Enter a valid delivery email address for your digital gift card.');
       }
     } else if (normalizedMethod === 'stripe_bank') {
-      if (dest.length < 4) {
+      if (dest.length < 4 || dest.length > 120) {
         throw httpError('Enter your Stripe Connect account ID (acct_...) or verified bank payout reference.');
       }
     }
@@ -1061,6 +1198,7 @@ export class PaymentsService {
   }
 
   async adminQuoteRedemption(adminSession, { redemptionId }) {
+    assertScalar(redemptionId, 'redemptionId');
     const r = this.store.get('redemptions', redemptionId);
     if (!r) throw httpError('Redemption not found', 404);
     if (!['pending_review', 'approved'].includes(r.status)) {
@@ -1085,7 +1223,8 @@ export class PaymentsService {
       const amt = r.amountUsd % 1 === 0 ? String(r.amountUsd) : r.amountUsd.toFixed(2);
       Object.assign(instructions, {
         cashtag: r.destination,
-        cashAppLink: `https://cash.app/${r.destination}/${amt}`,
+        amountFormatted: `$${amt}`,
+        cashAppLink: `https://cash.app/${r.destination}`,
         note: `Blinko Prize ${r.id}`,
       });
     } else if (r.method === 'giftcard') {
@@ -1108,6 +1247,9 @@ export class PaymentsService {
   }
 
   async adminMarkRedemptionPaid(adminSession, { redemptionId, txHash, receipt, note = '', executeLiveStripe = false }) {
+    assertScalar(redemptionId, 'redemptionId');
+    assertScalar(txHash, 'txHash');
+    assertScalar(receipt, 'receipt');
     const r = this.store.get('redemptions', redemptionId);
     if (!r) throw httpError('Redemption not found', 404);
     if (r.status === 'paid') return { redemption: r, alreadyPaid: true };
@@ -1180,7 +1322,7 @@ export class PaymentsService {
         status: 'paid',
         paidAt: new Date().toISOString(),
         paidBy: adminSession.userId,
-        operatorNote: note,
+        operatorNote: String(note || '').slice(0, 300),
       });
       this.store.put('redemptions', cur.id, cur);
       return { redemption: cur, alreadyPaid: false, balance };
@@ -1188,6 +1330,7 @@ export class PaymentsService {
   }
 
   adminRejectRedemption(adminSession, { redemptionId, reason = 'Operator declined payout' }) {
+    assertScalar(redemptionId, 'redemptionId');
     return this.store.transaction(() => {
       const r = this.store.get('redemptions', redemptionId);
       if (!r) throw httpError('Redemption not found', 404);
@@ -1195,11 +1338,11 @@ export class PaymentsService {
       if (r.status === 'rejected') return { redemption: r, alreadyRejected: true };
       const balance = this.wallet.refundRedemptionSync(r.userId, r.amountCents, {
         redemptionId: r.id,
-        reason,
+        reason: String(reason || '').slice(0, 300),
         rejectedBy: adminSession.userId,
       });
       r.status = 'rejected';
-      r.rejectionReason = String(reason);
+      r.rejectionReason = String(reason || '').slice(0, 300);
       r.rejectedAt = new Date().toISOString();
       r.rejectedBy = adminSession.userId;
       this.store.put('redemptions', r.id, r);

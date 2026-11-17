@@ -4,13 +4,21 @@
 const ERC20_TRANSFER_TOPIC0 = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 const DEFAULT_ENDPOINTS = {
-  ETH_RPC_URLS: ['https://ethereum-rpc.publicnode.com', 'https://eth.llamarpc.com'],
-  SOLANA_RPC_URLS: ['https://api.mainnet-beta.solana.com', 'https://solana-rpc.publicnode.com'],
+  ETH_RPC_URLS: [
+    'https://ethereum-rpc.publicnode.com',
+    'https://1rpc.io/eth',
+    'https://eth.llamarpc.com',
+  ],
+  SOLANA_RPC_URLS: [
+    'https://solana-rpc.publicnode.com',
+    'https://api.mainnet-beta.solana.com',
+    'https://1rpc.io/sol',
+  ],
   BTC_API_URLS: ['https://mempool.space/api', 'https://blockstream.info/api'],
 };
 
 function endpoints(env, key, single) {
-  const custom = env?.[single];
+  const custom = String(env?.[single] || '').trim();
   return custom ? [custom, ...DEFAULT_ENDPOINTS[key]] : DEFAULT_ENDPOINTS[key];
 }
 
@@ -53,7 +61,10 @@ export class CryptoVerifier {
   }
 
   async verifyTransfer({ asset, txHash, recipient }) {
-    const hash = String(txHash || '').trim();
+    if (typeof txHash !== 'string') {
+      return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction hash required' };
+    }
+    const hash = txHash.trim();
     if (!hash) return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction hash required' };
     if (!recipient) return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Recipient address missing' };
     if (asset.chain === 'bitcoin') return this._verifyBitcoin(hash, recipient);
@@ -71,22 +82,40 @@ export class CryptoVerifier {
     for (const base of endpoints(this.env, 'BTC_API_URLS', 'BTC_API_URL')) {
       try {
         const tx = await this._fetchJson(`${base}/tx/${txid}`);
-        if (tx?.__notFound) return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction not found on Bitcoin' };
+        if (tx?.__notFound) {
+          return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction not found on Bitcoin' };
+        }
         let sats = 0n;
         for (const out of tx.vout || []) {
-          if (String(out.scriptpubkey_address || '').toLowerCase() === target) sats += BigInt(out.value || 0);
+          if (String(out.scriptpubkey_address || '').toLowerCase() === target) {
+            sats += BigInt(out.value || 0);
+          }
         }
         let confirmations = 0;
         if (tx.status?.confirmed && tx.status.block_height) {
           const tip = Number(await this._fetchJson(`${base}/blocks/tip/height`));
           confirmations = tip >= tx.status.block_height ? tip - tx.status.block_height + 1 : 1;
         }
-        return { found: true, success: true, amountRaw: sats, confirmations, blockTime: tx.status?.block_time || null };
+        return {
+          found: true,
+          success: true,
+          amountRaw: sats,
+          confirmations,
+          pending: !tx.status?.confirmed,
+          blockTime: tx.status?.block_time || null,
+        };
       } catch (err) {
         lastErr = err;
       }
     }
-    return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: `Bitcoin API unavailable: ${lastErr?.message}`, retryable: true };
+    return {
+      found: false,
+      amountRaw: 0n,
+      confirmations: 0,
+      blockTime: null,
+      error: `Bitcoin API unavailable: ${lastErr?.message}`,
+      retryable: true,
+    };
   }
 
   async _verifyEthereum(asset, hash, recipient) {
@@ -101,18 +130,23 @@ export class CryptoVerifier {
         this._rpc(urls, 'eth_getTransactionReceipt', [hash]),
         this._rpc(urls, 'eth_blockNumber', []),
       ]);
-      if (!tx) return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction not found on Ethereum mainnet' };
-      if (!receipt) return { found: true, success: true, amountRaw: 0n, confirmations: 0, blockTime: null, pending: true };
+      if (!tx) {
+        return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction not found on Ethereum mainnet' };
+      }
+      if (!receipt) {
+        return { found: true, success: true, amountRaw: 0n, confirmations: 0, blockTime: null, pending: true };
+      }
       if (receipt.status !== '0x1') {
         return { found: true, success: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction reverted' };
       }
       const confirmations = Math.max(0, parseInt(headHex, 16) - parseInt(receipt.blockNumber, 16) + 1);
       let amount = 0n;
       if (asset.tokenContract) {
+        const expectedContract = asset.tokenContract.toLowerCase();
         const paddedTo = '0x' + target.slice(2).padStart(64, '0');
         for (const log of receipt.logs || []) {
           if (
-            String(log.address || '').toLowerCase() === asset.tokenContract &&
+            String(log.address || '').toLowerCase() === expectedContract &&
             String(log.topics?.[0] || '').toLowerCase() === ERC20_TRANSFER_TOPIC0 &&
             String(log.topics?.[2] || '').toLowerCase() === paddedTo
           ) {
@@ -127,9 +161,23 @@ export class CryptoVerifier {
         const block = await this._rpc(urls, 'eth_getBlockByNumber', [receipt.blockNumber, false]);
         blockTime = block?.timestamp ? parseInt(block.timestamp, 16) : null;
       } catch {}
-      return { found: true, success: true, amountRaw: amount, confirmations, blockTime, sender: String(tx.from || '').toLowerCase() };
+      return {
+        found: true,
+        success: true,
+        amountRaw: amount,
+        confirmations,
+        blockTime,
+        sender: String(tx.from || '').toLowerCase(),
+      };
     } catch (err) {
-      return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: `Ethereum RPC unavailable: ${err.message}`, retryable: true };
+      return {
+        found: false,
+        amountRaw: 0n,
+        confirmations: 0,
+        blockTime: null,
+        error: `Ethereum RPC unavailable: ${err.message}`,
+        retryable: true,
+      };
     }
   }
 
@@ -146,10 +194,23 @@ export class CryptoVerifier {
       if (!tx) {
         const st = await this._rpc(urls, 'getSignatureStatuses', [[sig], { searchTransactionHistory: true }]);
         const s = st?.value?.[0];
-        if (s && !s.err) return { found: true, success: true, amountRaw: 0n, confirmations: 0, blockTime: null, pending: true };
-        return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction not found on Solana (or not finalized yet)' };
+        if (s && s.err) {
+          return { found: true, success: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction failed on-chain' };
+        }
+        if (s && !s.err) {
+          return { found: true, success: true, amountRaw: 0n, confirmations: 0, blockTime: null, pending: true };
+        }
+        return {
+          found: false,
+          amountRaw: 0n,
+          confirmations: 0,
+          blockTime: null,
+          error: 'Transaction not found on Solana (or not finalized yet)',
+        };
       }
-      if (tx.meta?.err) return { found: true, success: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction failed on-chain' };
+      if (tx.meta?.err) {
+        return { found: true, success: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: 'Transaction failed on-chain' };
+      }
       let amount = 0n;
       if (asset.tokenMint) {
         const pre = tx.meta?.preTokenBalances || [];
@@ -160,8 +221,13 @@ export class CryptoVerifier {
           if (delta > 0n) amount += delta;
         }
       } else {
-        const keys = tx.transaction?.message?.accountKeys || [];
-        const idx = keys.findIndex((k) => (typeof k === 'string' ? k : k?.pubkey) === recipient);
+        const staticKeys = (tx.transaction?.message?.accountKeys || []).map((k) =>
+          typeof k === 'string' ? k : k?.pubkey
+        );
+        const loadedWritable = tx.meta?.loadedAddresses?.writable || [];
+        const loadedReadonly = tx.meta?.loadedAddresses?.readonly || [];
+        const allKeys = [...staticKeys, ...loadedWritable, ...loadedReadonly];
+        const idx = allKeys.findIndex((k) => k === recipient);
         if (idx !== -1) {
           const delta = BigInt(tx.meta?.postBalances?.[idx] ?? 0) - BigInt(tx.meta?.preBalances?.[idx] ?? 0);
           if (delta > 0n) amount = delta;
@@ -169,12 +235,20 @@ export class CryptoVerifier {
       }
       return { found: true, success: true, amountRaw: amount, confirmations: 32, blockTime: tx.blockTime || null };
     } catch (err) {
-      return { found: false, amountRaw: 0n, confirmations: 0, blockTime: null, error: `Solana RPC unavailable: ${err.message}`, retryable: true };
+      return {
+        found: false,
+        amountRaw: 0n,
+        confirmations: 0,
+        blockTime: null,
+        error: `Solana RPC unavailable: ${err.message}`,
+        retryable: true,
+      };
     }
   }
 
   static isValidAddress(asset, address) {
-    const a = String(address || '').trim();
+    if (typeof address !== 'string') return false;
+    const a = address.trim();
     if (asset.chain === 'bitcoin') return /^(bc1[02-9ac-hj-np-z]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/.test(a);
     if (asset.chain === 'ethereum') return /^0x[0-9a-fA-F]{40}$/.test(a);
     if (asset.chain === 'solana') return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a);

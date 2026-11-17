@@ -10,6 +10,12 @@ import {
 } from '../config/gameConfig.js';
 import { ServerWallet } from './ServerWallet.js';
 
+function assertPrimitive(val, name) {
+  if (val !== undefined && val !== null && typeof val === 'object') {
+    throw new Error(`Invalid ${name} parameter.`);
+  }
+}
+
 export function hashSeed(seed) {
   return crypto.createHash('sha256').update(String(seed)).digest('hex');
 }
@@ -143,13 +149,33 @@ export class BlinkoDropService {
   /**
    * Pure offline/revealed verification — strictly rejects unrevealed live seeds or shortcuts.
    */
-  verifyDropOutcome({ serverSeed, clientSeed, nonce, rows = 12, risk = 'MEDIUM', ballCount = 1, betPerBall = 1, currencyMode = 'SC' }) {
+  verifyDropOutcome({
+    serverSeed,
+    clientSeed,
+    nonce,
+    rows = 12,
+    risk = 'MEDIUM',
+    ballCount = 1,
+    betPerBall = 1,
+    currencyMode = 'SC',
+  }) {
+    assertPrimitive(serverSeed, 'serverSeed');
+    assertPrimitive(clientSeed, 'clientSeed');
+    assertPrimitive(nonce, 'nonce');
+    assertPrimitive(rows, 'rows');
+    assertPrimitive(risk, 'risk');
+    assertPrimitive(ballCount, 'ballCount');
+    assertPrimitive(betPerBall, 'betPerBall');
+    assertPrimitive(currencyMode, 'currencyMode');
+
     const cleanSeed = String(serverSeed || '').trim();
     if (!/^[0-9a-fA-F]{64}$/.test(cleanSeed)) {
       throw new Error('Provide a valid 64-character revealed serverSeed (rotate your seed first to reveal prior drops).');
     }
-    if (!clientSeed || !Number.isFinite(Number(nonce))) {
-      throw new Error('clientSeed and numeric nonce are required.');
+    const cleanClientSeed = String(clientSeed || '').slice(0, 64);
+    const parsedNonce = Number(nonce);
+    if (!cleanClientSeed || !Number.isInteger(parsedNonce) || parsedNonce < 1) {
+      throw new Error('clientSeed and positive integer nonce are required.');
     }
     const r = Number(rows);
     const rsk = String(risk || 'MEDIUM').toUpperCase();
@@ -158,19 +184,25 @@ export class BlinkoDropService {
     if (!BLINKO_RISKS.includes(rsk)) throw new Error(`Risk must be one of: ${BLINKO_RISKS.join(', ')}`);
     if (!Number.isInteger(count) || count < 1 || count > 10) throw new Error('ballCount must be 1-10');
 
-    const isSC = currencyMode === 'SC';
+    const mode = String(currencyMode || 'SC').toUpperCase();
+    const isSC = mode === 'SC';
+    const parsedBet = Number(betPerBall);
+    if (!Number.isFinite(parsedBet) || parsedBet <= 0) {
+      throw new Error('betPerBall must be a positive number.');
+    }
+
     const balls = [];
     let totalPayoutCentsOrGc = 0;
 
     for (let i = 0; i < count; i++) {
       const b = this._simulateBall({
         serverSeed: cleanSeed,
-        clientSeed,
-        nonce: Number(nonce),
+        clientSeed: cleanClientSeed,
+        nonce: parsedNonce,
         ballIndex: i,
         rows: r,
         risk: rsk,
-        betPerBall: Number(betPerBall),
+        betPerBall: parsedBet,
         isSC,
       });
       balls.push(b);
@@ -180,8 +212,8 @@ export class BlinkoDropService {
     return {
       verified: true,
       serverSeedHash: hashSeed(cleanSeed),
-      clientSeed: String(clientSeed),
-      nonce: Number(nonce),
+      clientSeed: cleanClientSeed,
+      nonce: parsedNonce,
       rows: r,
       risk: rsk,
       ballCount: count,
@@ -201,13 +233,20 @@ export class BlinkoDropService {
     characterId = 'polar_bear_2026',
     clientSeed,
   }) {
-    if (!userId) throw new Error('Authentication required.');
+    if (!userId || typeof userId !== 'string') throw new Error('Authentication required.');
+    assertPrimitive(currencyMode, 'currencyMode');
+    assertPrimitive(betPerBall, 'betPerBall');
+    assertPrimitive(rows, 'rows');
+    assertPrimitive(risk, 'risk');
+    assertPrimitive(ballCount, 'ballCount');
+    assertPrimitive(characterId, 'characterId');
+    assertPrimitive(clientSeed, 'clientSeed');
+
     const now = Date.now();
     const last = this.lastDropTimestamps.get(userId) || 0;
     if (now - last < 50) {
       throw new Error('Drop cooldown active. Let the pucks breathe!');
     }
-    this.lastDropTimestamps.set(userId, now);
 
     const mode = String(currencyMode || 'GC').toUpperCase();
     if (mode !== 'GC' && mode !== 'SC') throw new Error('currencyMode must be GC or SC.');
@@ -231,16 +270,29 @@ export class BlinkoDropService {
       throw new Error(`Bet per ball for ${mode} must be between ${limits.min} and ${limits.max}.`);
     }
 
+    if (this.lastDropTimestamps.size > 10000) {
+      for (const [uid, ts] of this.lastDropTimestamps.entries()) {
+        if (now - ts > 60_000) this.lastDropTimestamps.delete(uid);
+      }
+      if (this.lastDropTimestamps.size > 10000) this.lastDropTimestamps.clear();
+    }
+    this.lastDropTimestamps.set(userId, now);
+
     const totalBet = isSC
       ? ServerWallet.fromCents(ServerWallet.toCents(normalizedBet) * count)
       : normalizedBet * count;
 
-    const cSeed = clientSeed ? String(clientSeed).slice(0, 64) : crypto.randomBytes(12).toString('hex');
+    const cSeed =
+      typeof clientSeed === 'string' && clientSeed.trim()
+        ? clientSeed.trim().slice(0, 64)
+        : crypto.randomBytes(12).toString('hex');
     const validCharId = MEME_CHARACTER_IDS.includes(characterId) ? characterId : MEME_CHARACTER_IDS[0];
-    const seedRecord = this._getOrCreateUserSeed(userId);
 
     let dropOutcome = null;
+    let activeSeedHash = null;
     const settlement = this.wallet.settleDrop(userId, mode, totalBet, (nonce) => {
+      const seedRecord = this._getOrCreateUserSeed(userId);
+      activeSeedHash = hashSeed(seedRecord.activeSeed);
       const balls = [];
       let totalWinUnits = 0;
       let maxMultiplier = 0;
@@ -277,6 +329,7 @@ export class BlinkoDropService {
           maxMultiplier,
           buckets: balls.map((b) => b.bucketIndex),
           clientSeed: cSeed,
+          serverSeedHash: activeSeedHash,
         },
       };
     });
@@ -295,7 +348,7 @@ export class BlinkoDropService {
       balls: dropOutcome.balls,
       balance: settlement.account,
       provablyFair: {
-        serverSeedHash: hashSeed(seedRecord.activeSeed),
+        serverSeedHash: activeSeedHash,
         clientSeed: cSeed,
         nonce: settlement.nonce,
         algorithm: 'HMAC-SHA256',

@@ -53,6 +53,7 @@ export default function CashierModal({
 
   // Cash App deposit state
   const [senderTag, setSenderTag] = useState('');
+  const [cashAppReceiptRef, setCashAppReceiptRef] = useState('');
   const [activeOrder, setActiveOrder] = useState(null);
 
   // Card / Stripe state
@@ -89,6 +90,7 @@ export default function CashierModal({
     setActiveDeposit(null);
     setActiveOrder(null);
     setTxHashInput('');
+    setCashAppReceiptRef('');
 
     apiClient.getPaymentsConfig().then(setConfig).catch(() => {});
     if (!isGuest) {
@@ -107,6 +109,54 @@ export default function CashierModal({
       setHistoryData({ orders: o.orders || [], deposits: d.deposits || [], ledger: l.history || [] });
     });
   }, [isOpen, isGuest, tab]);
+
+  // Live auto-polling for on-chain crypto confirmations
+  useEffect(() => {
+    if (!isOpen || !activeDeposit?.id || !activeDeposit?.txHash) return undefined;
+    if (!['awaiting_payment', 'confirming'].includes(activeDeposit.status)) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const res = await apiClient.getCryptoStatus(activeDeposit.id);
+        if (res.deposit) setActiveDeposit(res.deposit);
+        if (res.credited && res.balance) {
+          onBalanceUpdate?.(res.balance);
+          soundEngine.playBucketLand(25);
+          setFeedback({
+            type: 'success',
+            message: `Verified on-chain! Credited ${Number(res.deposit.goldCoins).toLocaleString()} GC + ${Number(
+              res.deposit.freeSweepsCoins
+            ).toFixed(2)} FREE SC.`,
+          });
+        }
+      } catch {}
+    }, 12000);
+    return () => clearInterval(timer);
+  }, [isOpen, activeDeposit?.id, activeDeposit?.txHash, activeDeposit?.status, onBalanceUpdate]);
+
+  // Live auto-polling for Cash App confirmation
+  useEffect(() => {
+    if (!isOpen || !activeOrder?.id) return undefined;
+    if (!['awaiting_payment', 'awaiting_confirmation'].includes(activeOrder.status)) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const res = await apiClient.getCashAppOrderStatus(activeOrder.id);
+        if (res.order) {
+          setActiveOrder(res.order);
+          if (res.order.status === 'confirmed' && res.balance) {
+            onBalanceUpdate?.(res.balance);
+            soundEngine.playBucketLand(25);
+            setFeedback({
+              type: 'success',
+              message: `Cash App payment confirmed! Credited ${Number(res.order.goldCoins).toLocaleString()} GC + ${Number(
+                res.order.freeSweepsCoins
+              ).toFixed(2)} FREE SC.`,
+            });
+          }
+        }
+      } catch {}
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [isOpen, activeOrder?.id, activeOrder?.status, onBalanceUpdate]);
 
   if (!isOpen) return null;
 
@@ -135,15 +185,21 @@ export default function CashierModal({
     soundEngine.playButtonClick(580);
   };
 
-  const selectCustomPackage = () => {
-    const raw = Number(customAmount);
-    const num = Number(Math.max(1, Math.min(50000, Number.isFinite(raw) ? raw : 25)).toFixed(2));
-    selectPackage({
-      id: `pkg_custom_${num}`,
-      tierTitle: `Custom Headline Bundle ($${num.toFixed(2)})`,
-      priceUsd: num,
-      isCustom: true,
-    });
+  const selectCustomPackage = async () => {
+    if (isGuest) {
+      onRequireAuth?.();
+      return;
+    }
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const res = await apiClient.quoteCustomPackage(customAmount);
+      selectPackage(res.package);
+    } catch (err) {
+      setFeedback({ type: 'error', message: err.message });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleGenerateCryptoQuote = async () => {
@@ -215,12 +271,16 @@ export default function CashierModal({
     setBusy(true);
     setFeedback(null);
     try {
-      const res = await apiClient.markCashAppSent({ orderId: activeOrder.id, senderTag: senderTag.trim() });
+      const res = await apiClient.markCashAppSent({
+        orderId: activeOrder.id,
+        senderTag: senderTag.trim() || activeOrder.senderTag || '',
+        receiptRef: cashAppReceiptRef.trim() || undefined,
+      });
       setActiveOrder(res.order);
       soundEngine.playBucketLand(5);
       setFeedback({
         type: 'success',
-        message: `Order ${res.order.orderRef} submitted! Once our operator verifies receipt, your GC & FREE SC will credit automatically.`,
+        message: `Order ${res.order.orderRef} submitted! Keep this window open or keep playing — your GC & FREE SC credit automatically on confirmation.`,
       });
     } catch (err) {
       setFeedback({ type: 'error', message: err.message });
@@ -450,11 +510,11 @@ export default function CashierModal({
               <div className="selected-summary">
                 <strong>{activePkg.tierTitle}</strong> —{' '}
                 <span>${activePkg.priceUsd.toFixed(2)} USD</span>
-                {!activePkg.isCustom && (
+                {activePkg.goldCoins != null && (
                   <>
                     {' '}
-                    ({activePkg.goldCoins.toLocaleString()} GC +{' '}
-                    <strong>{activePkg.freeSweepsCoins.toFixed(2)} FREE SC</strong>)
+                    ({Number(activePkg.goldCoins).toLocaleString()} GC +{' '}
+                    <strong>{Number(activePkg.freeSweepsCoins || 0).toFixed(2)} FREE SC</strong>)
                   </>
                 )}
               </div>
@@ -604,7 +664,31 @@ export default function CashierModal({
                     <div className="quote-details">
                       <div className="detail-row">
                         <span>Pay To Cashtag:</span>
-                        <strong>{activeOrder.payTo}</strong>
+                        <div className="copy-val">
+                          <strong className="mono">{activeOrder.payTo}</strong>
+                          <button
+                            type="button"
+                            className="icon-btn small"
+                            onClick={() => copyText('cashtag', activeOrder.payTo)}
+                            aria-label="Copy receiving Cashtag"
+                          >
+                            {copiedKey === 'cashtag' ? <Check size={14} /> : <Copy size={14} />}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="detail-row">
+                        <span>Exact Amount USD:</span>
+                        <div className="copy-val">
+                          <strong className="mono">${Number(activeOrder.amountUsd).toFixed(2)}</strong>
+                          <button
+                            type="button"
+                            className="icon-btn small"
+                            onClick={() => copyText('ca_amt', Number(activeOrder.amountUsd).toFixed(2))}
+                            aria-label="Copy exact USD amount"
+                          >
+                            {copiedKey === 'ca_amt' ? <Check size={14} /> : <Copy size={14} />}
+                          </button>
+                        </div>
                       </div>
                       <div className="detail-row">
                         <span>Include Exact Memo / Note:</span>
@@ -620,12 +704,27 @@ export default function CashierModal({
                           </button>
                         </div>
                       </div>
+                      {['awaiting_payment', 'awaiting_confirmation'].includes(activeOrder.status) && (
+                        <div className="field" style={{ marginTop: 8 }}>
+                          <label htmlFor="cashapp-receipt-ref">Optional: Cash App Receipt / Confirmation ID or Link</label>
+                          <input
+                            id="cashapp-receipt-ref"
+                            type="text"
+                            placeholder="Paste Cash App web receipt link or payment ID…"
+                            value={cashAppReceiptRef}
+                            onChange={(e) => setCashAppReceiptRef(e.target.value)}
+                          />
+                        </div>
+                      )}
                       <p className="modal-sub">
-                        Status: <strong>{activeOrder.status}</strong>. After completing the payment in Cash App, click below:
+                        Status: <strong>{activeOrder.status}</strong>.{' '}
+                        {activeOrder.status === 'confirmed'
+                          ? 'Credited to your account!'
+                          : 'After completing the payment in Cash App, click below:'}
                       </p>
                       {activeOrder.status === 'awaiting_payment' && (
                         <button type="button" className="btn-primary" onClick={handleMarkCashAppSent} disabled={busy}>
-                          I&apos;ve Sent ${activeOrder.amountUsd} on Cash App
+                          I&apos;ve Sent ${Number(activeOrder.amountUsd).toFixed(2)} on Cash App
                         </button>
                       )}
                     </div>

@@ -385,6 +385,11 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
                     <div className="queue-meta">
                       User: <code>{k.userId}</code> • {k.address?.line1}, {k.address?.city}, {k.address?.state}{' '}
                       {k.address?.zip}
+                      {k.duplicateOf?.length > 0 && (
+                        <div style={{ color: '#f87171', marginTop: 4 }}>
+                          ⚠ Duplicate Identity Match: {k.duplicateOf.join(', ')}
+                        </div>
+                      )}
                     </div>
                     {k.status === 'pending' && (
                       <div className="queue-actions">
@@ -415,6 +420,7 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
                     </div>
                     <div className="queue-meta mono">
                       User: {o.userId} • {o.goldCoins.toLocaleString()} GC + {o.freeSweepsCoins} SC
+                      {o.customerReceiptRef && ` • Player Ref: ${o.customerReceiptRef}`}
                     </div>
                     {['awaiting_payment', 'awaiting_confirmation'].includes(o.status) && (
                       <div className="queue-actions">
@@ -422,10 +428,27 @@ export default function AdminConsoleModal({ isOpen, onClose, onBalanceMayHaveCha
                           type="text"
                           placeholder="Cash App Web Receipt ID…"
                           aria-label={`Receipt ID for ${o.orderRef}`}
-                          value={receiptInputs[o.id] || ''}
+                          value={receiptInputs[o.id] ?? o.customerReceiptRef ?? ''}
                           onChange={(e) => setReceiptInputs({ ...receiptInputs, [o.id]: e.target.value })}
                         />
-                        <button type="button" className="btn-primary" onClick={() => handleConfirmOrder(o.id)}>
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          onClick={() => {
+                            const val = (receiptInputs[o.id] ?? o.customerReceiptRef ?? '').trim();
+                            setReceiptInputs((prev) => ({ ...prev, [o.id]: val }));
+                            setBusy(true);
+                            apiClient
+                              .adminConfirmOrder({ orderId: o.id, cashAppPaymentId: val })
+                              .then(() => {
+                                setToast({ type: 'success', message: `Cash App order ${o.orderRef} confirmed & credited!` });
+                                onBalanceMayHaveChanged?.();
+                                return refreshAll();
+                              })
+                              .catch((err) => setToast({ type: 'error', message: err.message }))
+                              .finally(() => setBusy(false));
+                          }}
+                        >
                           Confirm &amp; Credit
                         </button>
                       </div>

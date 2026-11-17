@@ -28,6 +28,8 @@ async function request(path, { method = 'GET', body } = {}) {
 export const apiClient = {
   // Public safe config
   getGameConfig: () => request('/api/game/config'),
+  quoteCustomPackage: (amountUsd) =>
+    request(`/api/game/custom-package?amountUsd=${encodeURIComponent(amountUsd)}`),
   getPaymentsConfig: () => request('/api/payments/config'),
 
   // Auth (HttpOnly; SameSite=Strict cookie sessions managed by browser)
@@ -54,6 +56,8 @@ export const apiClient = {
 
   createCashAppOrder: (payload) => request('/api/orders/cashapp', { method: 'POST', body: payload }),
   markCashAppSent: (payload) => request('/api/orders/cashapp/sent', { method: 'POST', body: payload }),
+  getCashAppOrderStatus: (orderId) =>
+    request(`/api/orders/cashapp/status?orderId=${encodeURIComponent(orderId)}`),
   myOrders: () => request('/api/orders/mine'),
 
   createOnrampLink: (payload) => request('/api/payments/onramp', { method: 'POST', body: payload }),

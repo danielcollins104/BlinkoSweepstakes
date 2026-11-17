@@ -7,6 +7,9 @@ import { SWEEPSTAKES_CONFIG } from '../config/sweepstakesConfig.js';
  */
 export class ServerWallet {
   static toCents(amount) {
+    if (typeof amount !== 'number' && typeof amount !== 'string') {
+      throw new Error('Invalid amount format');
+    }
     const n = Number(amount);
     if (!Number.isFinite(n)) throw new Error('Invalid amount');
     return Math.round(n * 100);
@@ -39,8 +42,8 @@ export class ServerWallet {
     });
   }
 
-  getAccount(userId, { isGuest = false } = {}) {
-    return ServerWallet.view(this._load(userId, { isGuest }));
+  getAccount(userId, { isGuest = false, allowWelcomeSC = true } = {}) {
+    return ServerWallet.view(this._load(userId, { isGuest, allowWelcomeSC }));
   }
 
   static view(acc) {
@@ -57,11 +60,11 @@ export class ServerWallet {
     };
   }
 
-  _load(userId, { isGuest = false } = {}) {
-    if (!userId) throw new Error('userId required');
+  _load(userId, { isGuest = false, allowWelcomeSC = true } = {}) {
+    if (!userId || typeof userId !== 'string') throw new Error('userId required');
     let acc = this.store.get('accounts', userId);
     if (!acc) {
-      const welcomeSC = isGuest ? 0 : ServerWallet.toCents(this.welcomeSC);
+      const welcomeSC = isGuest || !allowWelcomeSC ? 0 : ServerWallet.toCents(this.welcomeSC);
       acc = {
         userId,
         goldCoins: this.welcomeGC,
@@ -95,6 +98,9 @@ export class ServerWallet {
     if (acc.goldCoins < 0 || acc.scCents < 0 || acc.pendingCents < 0 || acc.unplayedCents < 0) {
       throw new Error('Wallet invariant violated: negative balance');
     }
+    if (!Number.isSafeInteger(acc.goldCoins) || !Number.isSafeInteger(acc.scCents)) {
+      throw new Error('Wallet invariant violated: non-integer balance');
+    }
     this.store.put('accounts', acc.userId, acc);
   }
 
@@ -108,7 +114,10 @@ export class ServerWallet {
     return this.store.transaction(() => {
       const acc = this._load(userId);
       if (isSC && acc.isGuest) throw new Error('Sweeps Coins play requires a registered account.');
-      const betUnits = isSC ? ServerWallet.toCents(betAmount) : Math.round(betAmount);
+      const betUnits = isSC ? ServerWallet.toCents(betAmount) : Math.round(Number(betAmount));
+      if (!Number.isSafeInteger(betUnits) || betUnits <= 0) {
+        throw new Error('Invalid bet amount');
+      }
       const before = isSC ? acc.scCents : acc.goldCoins;
       if (before < betUnits) {
         throw new Error(
@@ -137,8 +146,8 @@ export class ServerWallet {
       });
 
       const { winAmount = 0, metadata = {} } = resolve(nonce, betTx.id) || {};
-      const winUnits = isSC ? ServerWallet.toCents(winAmount) : Math.round(winAmount);
-      if (winUnits < 0) throw new Error('Win amount cannot be negative');
+      const winUnits = isSC ? ServerWallet.toCents(winAmount) : Math.round(Number(winAmount));
+      if (!Number.isSafeInteger(winUnits) || winUnits < 0) throw new Error('Win amount cannot be negative');
       let winTx = null;
       if (winUnits > 0) {
         if (isSC) acc.scCents += winUnits;
@@ -224,7 +233,7 @@ export class ServerWallet {
         });
       }
       const acc = this._load(userId);
-      const gc = Math.max(0, Math.round(goldCoins));
+      const gc = Math.max(0, Math.round(Number(goldCoins) || 0));
       const sc = acc.isGuest ? 0 : Math.max(0, ServerWallet.toCents(sweepsCoins));
       const scBefore = acc.scCents;
       const gcBefore = acc.goldCoins;
@@ -354,11 +363,12 @@ export class ServerWallet {
     const isSC = currency === 'SC';
     return this.store.transaction(() => {
       const acc = this._load(userId);
-      const units = isSC ? ServerWallet.toCents(amount) : Math.round(amount);
+      const units = isSC ? ServerWallet.toCents(amount) : Math.round(Number(amount));
+      if (!Number.isSafeInteger(units)) throw new Error('Invalid adjustment amount');
       const before = isSC ? acc.scCents : acc.goldCoins;
       const after = before + units;
       if (after < 0) {
-        throw new Error(`Adjustment would cause negative balance.`);
+        throw new Error('Adjustment would cause negative balance.');
       }
       if (isSC) {
         acc.scCents = after;

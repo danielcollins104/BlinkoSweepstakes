@@ -1,18 +1,37 @@
 import crypto from 'node:crypto';
 
+const INSECURE_PLACEHOLDER_SECRETS = new Set([
+  'change-this-admin-secret',
+  'changeme',
+  'admin',
+  'password',
+  'secret',
+]);
+
+function asPlainString(val, maxLen = 512) {
+  if (val === undefined || val === null) return '';
+  if (typeof val !== 'string') throw new Error('Invalid input format.');
+  return val.slice(0, maxLen);
+}
+
 /**
  * Player Authentication & Admin RBAC (store-backed).
- * - PBKDF2-HMAC-SHA512 password hashing
- * - SHA-256 hashed 256-bit bearer tokens
+ * - PBKDF2-HMAC-SHA512 password hashing (100,000 iterations, 256-bit salt)
+ * - SHA-256 hashed 256-bit CSPRNG session tokens
+ * - Atomic email uniqueness via claimed_tx primary key constraint
  * - Roles: PLAYER, GUEST, ADMIN
  */
 export class AuthService {
   constructor(store, ledger, options = {}) {
     this.store = store;
     this.ledger = ledger;
+    const rawAdminSecret = String(
+      options.adminSecret || (typeof process !== 'undefined' && process.env?.DC_ADMIN_SECRET) || ''
+    ).trim();
     this.adminSecret =
-      String(options.adminSecret || (typeof process !== 'undefined' && process.env?.DC_ADMIN_SECRET) || '').trim() ||
-      null;
+      rawAdminSecret && !INSECURE_PLACEHOLDER_SECRETS.has(rawAdminSecret.toLowerCase()) && rawAdminSecret.length >= 12
+        ? rawAdminSecret
+        : null;
     this.failedAttempts = new Map();
     this._lastPurge = 0;
   }
@@ -31,14 +50,27 @@ export class AuthService {
   }
 
   static verifyPassword(password, stored) {
-    if (!stored || !stored.includes(':')) return false;
+    if (typeof password !== 'string' || !stored || typeof stored !== 'string' || !stored.includes(':')) {
+      return false;
+    }
     const [salt, originalHash] = stored.split(':');
-    const computedHash = crypto.pbkdf2Sync(String(password || ''), salt, 100000, 64, 'sha512').toString('hex');
+    const computedHash = crypto.pbkdf2Sync(password.slice(0, 256), salt, 100000, 64, 'sha512').toString('hex');
     return this.timingSafeEqual(computedHash, originalHash);
   }
 
   static tokenKey(token) {
     return crypto.createHash('sha256').update(String(token)).digest('hex');
+  }
+
+  _pruneFailedAttempts() {
+    if (this.failedAttempts.size <= 10000) return;
+    const now = Date.now();
+    for (const [k, rec] of this.failedAttempts.entries()) {
+      if (!rec.lockedUntil || rec.lockedUntil < now) {
+        this.failedAttempts.delete(k);
+      }
+    }
+    if (this.failedAttempts.size > 10000) this.failedAttempts.clear();
   }
 
   _checkBruteForce(identifier) {
@@ -50,6 +82,7 @@ export class AuthService {
   }
 
   _recordFailedAttempt(identifier) {
+    this._pruneFailedAttempts();
     const record = this.failedAttempts.get(identifier) || { count: 0, lockedUntil: null };
     record.count += 1;
     if (record.count >= 5) record.lockedUntil = Date.now() + 15 * 60 * 1000;
@@ -61,13 +94,23 @@ export class AuthService {
   }
 
   getUserByEmail(email) {
-    const clean = String(email || '').trim().toLowerCase();
+    if (typeof email !== 'string') return null;
+    const clean = email.trim().toLowerCase();
     if (!clean) return null;
     return this.store.find('users', { k1: clean, limit: 1 })[0] || null;
   }
 
   getUserById(userId) {
+    if (typeof userId !== 'string' || !userId) return null;
     return this.store.get('users', userId);
+  }
+
+  countRecentIpRegistrations(ip, windowMs = 24 * 60 * 60 * 1000) {
+    if (!ip || ip === 'unknown' || ip === '127.0.0.1' || ip === '::1') return 0;
+    const cutoff = Date.now() - windowMs;
+    return this.store
+      .find('users', { k2: 'PLAYER', limit: 300 })
+      .filter((u) => u.registrationIp === ip && Date.parse(u.createdAt) >= cutoff).length;
   }
 
   updateUser(userId, patch) {
@@ -90,24 +133,48 @@ export class AuthService {
     };
   }
 
-  registerUser({ email, password, name, phone = null }) {
-    const cleanEmail = String(email || '').trim().toLowerCase();
-    if (!cleanEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cleanEmail)) throw new Error('Valid email required.');
-    if (!password || String(password).length < 8) throw new Error('Password must be at least 8 characters long.');
-    if (this.getUserByEmail(cleanEmail)) throw new Error('An account with this email already exists.');
+  registerUser({ email, password, name, phone = null, ip = null }) {
+    const cleanEmail = asPlainString(email, 180).trim().toLowerCase();
+    const rawPassword = asPlainString(password, 256);
+    const rawName = name === undefined || name === null ? '' : asPlainString(name, 80).trim();
+    const rawPhone = phone === undefined || phone === null ? null : asPlainString(phone, 32).trim();
+
+    if (!cleanEmail || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cleanEmail)) {
+      throw new Error('Valid email required.');
+    }
+    if (rawPassword.length < 8) {
+      throw new Error('Password must be at least 8 characters long.');
+    }
+    if (this.getUserByEmail(cleanEmail)) {
+      throw new Error('An account with this email already exists.');
+    }
 
     const userId = `usr_${crypto.randomBytes(8).toString('hex')}`;
     const user = {
       id: userId,
       email: cleanEmail,
-      name: String(name || cleanEmail.split('@')[0]).slice(0, 80),
-      phone,
-      passwordHash: AuthService.hashPassword(String(password)),
+      name: (rawName || cleanEmail.split('@')[0]).slice(0, 80),
+      phone: rawPhone,
+      passwordHash: AuthService.hashPassword(rawPassword),
       role: 'PLAYER',
       kycStatus: 'none',
+      registrationIp: ip && typeof ip === 'string' ? ip : null,
       createdAt: new Date().toISOString(),
     };
     this.store.transaction(() => {
+      try {
+        this.store.insert('claimed_tx', `email:${cleanEmail}`, {
+          kind: 'user_email',
+          refId: userId,
+          userId,
+          at: user.createdAt,
+        });
+      } catch (err) {
+        if (err.code === 'DUPLICATE') {
+          throw new Error('An account with this email already exists.');
+        }
+        throw err;
+      }
       this.store.insert('users', userId, user);
       this.ledger.append({
         userId,
@@ -123,10 +190,12 @@ export class AuthService {
   }
 
   loginUser(email, password) {
-    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanEmail = asPlainString(email, 180).trim().toLowerCase();
+    const rawPassword = asPlainString(password, 256);
+    if (!cleanEmail) throw new Error('Invalid email or password.');
     this._checkBruteForce(cleanEmail);
     const user = this.getUserByEmail(cleanEmail);
-    if (!user || !AuthService.verifyPassword(password, user.passwordHash)) {
+    if (!user || !AuthService.verifyPassword(rawPassword, user.passwordHash)) {
       this._recordFailedAttempt(cleanEmail);
       throw new Error('Invalid email or password.');
     }
@@ -137,16 +206,22 @@ export class AuthService {
 
   authenticateAdmin(adminKey) {
     if (!this.adminSecret) {
-      throw new Error('Admin access is disabled: DC_ADMIN_SECRET is not configured on the server.');
+      throw new Error('Admin access is disabled: configure a strong DC_ADMIN_SECRET (12+ chars) on the server.');
     }
     const lockId = '__admin_console__';
     this._checkBruteForce(lockId);
-    if (!adminKey || !AuthService.timingSafeEqual(String(adminKey), this.adminSecret)) {
+    const provided = typeof adminKey === 'string' ? adminKey : '';
+    if (!provided || !AuthService.timingSafeEqual(provided, this.adminSecret)) {
       this._recordFailedAttempt(lockId);
-      throw new Error(adminKey ? 'Unauthorized: Invalid operator key.' : 'Operator key required.');
+      throw new Error(provided ? 'Unauthorized: Invalid operator key.' : 'Operator key required.');
     }
     this._clearFailedAttempts(lockId);
-    const adminUser = { id: 'admin_master_01', name: 'Blinko Network Operator', role: 'ADMIN', email: 'operator@blinkonews.local' };
+    const adminUser = {
+      id: 'admin_master_01',
+      name: 'Blinko Network Operator',
+      role: 'ADMIN',
+      email: 'operator@blinkonews.local',
+    };
     this.ledger.append({
       userId: adminUser.id,
       type: 'ADMIN_LOGIN',
@@ -196,13 +271,22 @@ export class AuthService {
   }
 
   validateSession(token, requiredRole = null) {
-    if (!token) throw new Error('Unauthorized: Authorization token missing');
+    if (!token || typeof token !== 'string') throw new Error('Unauthorized: Authorization token missing');
     const key = AuthService.tokenKey(token);
     const session = this.store.get('sessions', key);
     if (!session) throw new Error('Unauthorized: Session invalid or expired');
     if (Date.now() > session.expiresAt) {
       this.store.delete('sessions', key);
       throw new Error('Unauthorized: Session expired. Please sign in again.');
+    }
+    if (session.role === 'PLAYER') {
+      const user = this.store.get('users', session.userId);
+      if (user?.disabled) {
+        this.store.delete('sessions', key);
+        const err = new Error('This account has been disabled.');
+        err.status = 403;
+        throw err;
+      }
     }
     if (requiredRole && session.role !== requiredRole && session.role !== 'ADMIN') {
       throw new Error('Unauthorized: Forbidden');
@@ -211,6 +295,8 @@ export class AuthService {
   }
 
   revokeSession(token) {
-    if (token) this.store.delete('sessions', AuthService.tokenKey(token));
+    if (token && typeof token === 'string') {
+      this.store.delete('sessions', AuthService.tokenKey(token));
+    }
   }
 }

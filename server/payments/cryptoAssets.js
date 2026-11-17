@@ -85,6 +85,9 @@ const ALIASES = {
 };
 
 export function getAsset(symbol) {
+  if (typeof symbol !== 'string' && symbol !== undefined && symbol !== null) {
+    throw new Error('Invalid crypto asset symbol');
+  }
   const key = ALIASES[String(symbol || '').toUpperCase()] || String(symbol || '').toUpperCase();
   const asset = CRYPTO_ASSETS[key];
   if (!asset) throw new Error(`Unsupported crypto asset: ${symbol}`);
@@ -93,7 +96,7 @@ export function getAsset(symbol) {
 
 export function getReceivingAddress(asset, env = {}) {
   const envKey = `CRYPTO_WALLET_${asset.addressKey}`;
-  return (env && env[envKey]) || CRYPTO_WALLET_ADDRESSES[asset.addressKey] || '';
+  return String((env && env[envKey]) || CRYPTO_WALLET_ADDRESSES[asset.addressKey] || '').trim();
 }
 
 export function displayUnitsToString(units, decimals) {
@@ -103,6 +106,14 @@ export function displayUnitsToString(units, decimals) {
   const whole = s.slice(0, s.length - decimals);
   const frac = decimals > 0 ? s.slice(-decimals) : '';
   return `${neg ? '-' : ''}${whole}${decimals > 0 ? '.' + frac : ''}`;
+}
+
+export function parseDisplayUnits(amountStr, decimals) {
+  const clean = String(amountStr || '0').trim();
+  if (!/^\d+(\.\d+)?$/.test(clean)) return 0n;
+  const [wholePart, fracPart = ''] = clean.split('.');
+  const paddedFrac = fracPart.slice(0, decimals).padEnd(decimals, '0');
+  return BigInt(wholePart) * 10n ** BigInt(decimals) + BigInt(paddedFrac || '0');
 }
 
 export function chainToDisplayUnits(rawUnits, asset) {
@@ -150,13 +161,19 @@ export class PriceOracle {
 
     const krakenPair = { BTC: 'XBTUSD', ETH: 'ETHUSD', SOL: 'SOLUSD' }[priceKey];
     const geckoId = { BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana' }[priceKey];
+    const bitstampPair = { BTC: 'btcusd', ETH: 'ethusd', SOL: 'solusd' }[priceKey];
+
     const sources = await Promise.allSettled([
       this._json(`https://api.coinbase.com/v2/prices/${priceKey}-USD/spot`).then((d) => ['coinbase', Number(d?.data?.amount)]),
       this._json(`https://api.kraken.com/0/public/Ticker?pair=${krakenPair}`).then((d) => {
         const r = d?.result && Object.values(d.result)[0];
         return ['kraken', Number(r?.c?.[0])];
       }),
-      this._json(`https://api.coingecko.com/api/v3/simple/price?ids=${geckoId}&vs_currencies=usd`).then((d) => ['coingecko', Number(d?.[geckoId]?.usd)]),
+      this._json(`https://www.bitstamp.net/api/v2/ticker/${bitstampPair}/`).then((d) => ['bitstamp', Number(d?.last)]),
+      this._json(`https://api.coingecko.com/api/v3/simple/price?ids=${geckoId}&vs_currencies=usd`).then((d) => [
+        'coingecko',
+        Number(d?.[geckoId]?.usd),
+      ]),
     ]);
 
     const ok = sources.filter((s) => s.status === 'fulfilled' && s.value[1] > 0).map((s) => s.value);
@@ -174,7 +191,10 @@ export class PriceOracle {
     }
 
     const prices = ok.map((s) => s[1]).sort((a, b) => a - b);
-    const mid = prices.length % 2 ? prices[(prices.length - 1) / 2] : (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2;
+    const mid =
+      prices.length % 2
+        ? prices[(prices.length - 1) / 2]
+        : (prices[prices.length / 2 - 1] + prices[prices.length / 2]) / 2;
     if (prices.length > 1 && (prices[prices.length - 1] - prices[0]) / mid > 0.05) {
       throw new Error(`${priceKey} price sources diverged — try again shortly.`);
     }

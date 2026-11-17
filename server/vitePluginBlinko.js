@@ -3,6 +3,8 @@ import path from 'node:path';
 import { ApiRouter } from './apiRouter.js';
 import { openDefaultSqliteStore } from './store/nodeSqlite.js';
 
+const MAX_API_BODY_BYTES = 262_144;
+
 export function loadEnvLocal(cwd = process.cwd()) {
   try {
     const envPath = path.resolve(cwd, '.env.local');
@@ -48,14 +50,34 @@ export function blinkoApiPlugin() {
           const urlObj = new URL(url, 'http://localhost');
           const pathname = urlObj.pathname;
           let body = '';
-          req.on('data', (chunk) => {
-            body += chunk;
-            if (body.length > 1e6) req.destroy();
+          let byteLen = 0;
+          let aborted = false;
+
+          req.on('error', () => {
+            aborted = true;
           });
+
+          req.on('data', (chunk) => {
+            if (aborted) return;
+            byteLen += chunk.length;
+            if (byteLen > MAX_API_BODY_BYTES) {
+              aborted = true;
+              if (!res.headersSent) {
+                res.statusCode = 413;
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ error: 'Payload too large' }));
+              }
+              req.destroy();
+              return;
+            }
+            body += chunk.toString('utf8');
+          });
+
           req.on('end', async () => {
+            if (aborted) return;
             try {
               const router = await getRouter();
-              const isSecure = String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+              const isSecure = Boolean(req.socket?.encrypted);
               const response = await router.handleRequest(req.method, pathname, req.headers, body, {
                 query: urlObj.searchParams,
                 ip: req.socket?.remoteAddress || '127.0.0.1',
@@ -66,10 +88,12 @@ export function blinkoApiPlugin() {
                 res.setHeader(k, v);
               }
               res.end(response.body !== null ? JSON.stringify(response.body) : undefined);
-            } catch (err) {
-              res.statusCode = 500;
-              res.setHeader('Content-Type', 'application/json');
-              res.end(JSON.stringify({ error: 'Internal server error' }));
+            } catch {
+              if (!res.headersSent) {
+                res.statusCode = 500;
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify({ error: 'Internal server error' }));
+              }
             }
           });
         } else {

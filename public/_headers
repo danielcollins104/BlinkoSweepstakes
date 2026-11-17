@@ -3,4 +3,7 @@
   X-Content-Type-Options: nosniff
   X-Frame-Options: DENY
   Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+  Cross-Origin-Opener-Policy: same-origin
+  X-Permitted-Cross-Domain-Policies: none
   Content-Security-Policy: default-src 'self'; script-src 'self' https://secure.nmi.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://secure.nmi.com; frame-src https://secure.nmi.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://checkout.stripe.com

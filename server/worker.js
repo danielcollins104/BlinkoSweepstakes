@@ -116,6 +116,9 @@ export default {
       newHeaders.set('X-Content-Type-Options', 'nosniff');
       newHeaders.set('X-Frame-Options', 'DENY');
       newHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+      newHeaders.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+      newHeaders.set('Cross-Origin-Opener-Policy', 'same-origin');
+      newHeaders.set('X-Permitted-Cross-Domain-Policies', 'none');
       newHeaders.set('Content-Security-Policy', STATIC_CSP);
       return new Response(assetRes.body, {
         status: assetRes.status,
