@@ -79,7 +79,7 @@ await test('Client-side src/ contains zero game math, RNG, wallet addresses, or 
     assert.ok(!code.includes('bc1qwhnp4ylpv2h2q5x0rr9zm3zpwfcw3rtdmz4q4q'), `No BTC wallet in client: ${file}`);
     assert.ok(!code.includes('0x6258e488F97617cc103838746955CB81a1d3E3af'), `No ETH wallet in client: ${file}`);
     assert.ok(!code.includes('Ejj7hyePNeC9yHQKuEnRvjSiSdJ7sZfNsdmm3YZxFS1f'), `No SOL wallet in client: ${file}`);
-    assert.ok(!code.includes('Daniel-Collins-168'), `No Cashtag hardcoded in client: ${file}`);
+    assert.ok(!code.includes('Jimboxx1953'), `No Cashtag hardcoded in client: ${file}`);
     assert.ok(!code.includes('DC_ADMIN_SECRET ==='), `No admin secret comparison in client: ${file}`);
   }
 });
@@ -152,7 +152,7 @@ await test('Full Security Boundaries + Anti-Hack Red Team + All Crypto & Cash Ap
       STRIPE_SECRET_KEY: 'sk_test_mock_key',
       STRIPE_WEBHOOK_SECRET: 'whsec_test_secret',
       PUBLIC_ORIGIN: 'https://blinkosweepstakes.oopsiwon.com',
-      CASHTAG: '$Daniel-Collins-168',
+      CASHTAG: '$Jimboxx1953',
     },
     priceOracle: mockOracle,
     verifier: mockVerifier,
@@ -166,7 +166,7 @@ await test('Full Security Boundaries + Anti-Hack Red Team + All Crypto & Cash Ap
   assert.equal(pubPay.status, 200);
   const pubJson = JSON.stringify(pubPay.body);
   assert.equal(pubPay.body.cashApp.cashtag, undefined);
-  assert.ok(!pubJson.includes('Daniel-Collins'));
+  assert.ok(!pubJson.includes('Jimboxx1953'));
   assert.ok(!pubJson.includes('bc1qwhnp'));
   assert.ok(!pubJson.includes('Ejj7hyeP'));
 
@@ -475,8 +475,8 @@ await test('Full Security Boundaries + Anti-Hack Red Team + All Crypto & Cash Ap
     { packageId: 'pkg_chipperty_popular', senderTag: '$PlayerTag26' }
   );
   assert.equal(ordRes.status, 201);
-  assert.equal(ordRes.body.order.payTo, '$Daniel-Collins-168');
-  assert.equal(ordRes.body.order.paymentLink, 'https://cash.app/$Daniel-Collins-168');
+  assert.equal(ordRes.body.order.payTo, '$Jimboxx1953');
+  assert.equal(ordRes.body.order.paymentLink, 'https://cash.app/$Jimboxx1953');
   const ordId = ordRes.body.order.id;
 
   const sentRes = await router.handleRequest(

@@ -80,7 +80,7 @@ export class PaymentsService {
     this.verifier = deps.verifier || new CryptoVerifier({ env: this.env, fetchImpl: deps.fetchImpl });
     this.nmi = deps.nmi || new NmiGateway({ env: this.env, fetchImpl: deps.fetchImpl });
     this.stripe = deps.stripe || new StripeGateway({ env: this.env, fetchImpl: deps.fetchImpl });
-    this.cashtag = normalizeCashtag(getCashtagHandle(this.env)) || '$Daniel-Collins-168';
+    this.cashtag = normalizeCashtag(getCashtagHandle(this.env)) || '$Jimboxx1953';
   }
 
   resolvePackage(packageId, customAmountUsd = null) {

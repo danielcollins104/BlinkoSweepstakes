@@ -20,7 +20,8 @@
   },
   "vars": {
     "GEO_ENFORCE": "true",
-    "PUBLIC_ORIGIN": "https://blinkosweepstakes.oopsiwon.com"
+    "PUBLIC_ORIGIN": "https://blinkosweepstakes.oopsiwon.com",
+    "CASHTAG": "$Jimboxx1953"
   },
   "durable_objects": {
     "bindings": [

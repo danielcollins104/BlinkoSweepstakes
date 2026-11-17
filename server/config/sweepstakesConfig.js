@@ -10,7 +10,7 @@ export function getCashtagHandle(env = {}) {
     (env && (env.CASHTAG_HANDLE || env.CASHTAG)) ||
     (typeof process !== 'undefined' && (process.env?.CASHTAG_HANDLE || process.env?.CASHTAG)) ||
     '';
-  return String(fromEnv).trim() || '$Daniel-Collins-168';
+  return String(fromEnv).trim() || '$Jimboxx1953';
 }
 
 export const CRYPTO_WALLET_ADDRESSES = {
